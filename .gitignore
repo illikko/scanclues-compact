@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Outputs
+*.csv
+*.xlsx
+*.zip
+*.html
+
+# OS
+.DS_Store
+Thumbs.db
