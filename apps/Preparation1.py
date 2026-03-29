@@ -243,22 +243,22 @@ def run():
             - de fournir un rapport HTML et des fichiers csv qui résument les analyses et insights extraits.
             - de poser des questions sur l'analyse réalisée
             
-            L'utilisateur doit intervenir à plusieurs étapes pour:
+            L'utilisateur doit intervenir à plusieurs étapes pour:\n
             1- vérifier que le jeu de données correspond au format attendu (voir plus bas)\n
             2- télécharger le jeu de données\n
-            3- sélectionner son objectif: préparation du jeu de données, et le profilage, et l'analyse descriptive) et en option définir ce qu'il cherche (brief)
-            3- lire l'analyse dans l'application et/ou la télécharger (fichiers HTML et CSVs), 
-            4- poser des questions.\n
+            3- sélectionner son objectif: préparation du jeu de données, et le profilage, et l'analyse descriptive) et en option définir ce qu'il cherche (brief)\n
+            4- lire l'analyse dans l'application et/ou la télécharger (fichiers HTML et CSVs)\n
+            5- poser des questions\n
             
             Par défaut l'application exécute les 19 modules (dont le titre défile en haut de page) et produit une analyse standard.
             L'icône en haut à droite indique si un traitement est en cours: il faut attendre quelques minutes entre les étapes 2- et 3-, puis 3- et 4-.
                           
             L'application est particulièrement adaptée aux cas d'usage suivants : enquêtes, analyses marketing (CRM, web analytics...), RH (satisfaction, attrition...), open data, etc.
             
-            Les formats de fichiers supportés sont:
-            - CSV (séparateur point-virgule) .csv et Excel .xlsx 
-            - Le nom des champs doit être sur la 1ère ligne.
-            - pas de défaut majeur : saut de ligne, décalage de colonnes,...
+            Les formats de fichiers supportés sont:\n
+            - CSV (séparateur point-virgule) .csv et Excel .xlsx \n
+            - Le nom des champs doit être sur la 1ère ligne\n
+            - pas de défaut majeur : saut de ligne, décalage de colonnes,...\n
             
             L'application utilise les meilleurs modèles d'IA, LLM et statistiques, pour automatiser l'analyse des données tabulaires.
             C'est la version alpha, sur un mode "work in progress".

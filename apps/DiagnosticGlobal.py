@@ -149,7 +149,7 @@ def _suggest_preparation_tasks(df: pd.DataFrame, diag: dict) -> list[str]:
 
     # Modules toujours exécutés
     tasks.append("Détection des valeurs aberrantes")
-    tasks.append("Variables trop corrélées (NMI)")
+    tasks.append("Suppression des variables non informatives")
 
     # dédoublonnage
     return list(dict.fromkeys(tasks))
@@ -211,9 +211,9 @@ def render_pipeline_form() -> bool:
 
             with col1:
                 st.checkbox(
-                    "Preparation",
+                    "Préparation",
                     value=bool(current_selection.get("preparation", True)),
-                    help="Inclut : Preparation2, PreparationCorrelations, Outliers, CodificationOrdinales",
+                    help="Inclut : toutes les étapes de préparation identifiées (valeurs manquantes et aberrantes, variables non informatives, codification des variables ordinales, libellées trop longs, colonnes à multi-modalités, manquantes structurantes, etc.)",
                     key="ui_preparation",
                 )
 
@@ -221,7 +221,7 @@ def render_pipeline_form() -> bool:
                 st.checkbox(
                     "Profilage",
                     value=bool(current_selection.get("profilage", False)),
-                    help="Inclut : Segmentation, Profils_y",
+                    help="Inclut : Profils des segments sur la population globale, profils des segments cibles, etc.",
                     key="ui_profilage",
                 )
 
@@ -229,6 +229,7 @@ def render_pipeline_form() -> bool:
                 st.checkbox(
                     "Analyse descriptive",
                     value=bool(current_selection.get("analyse_descriptive", False)),
+                    help="Inclut : relations statistiques et sémantique entre les variables, représentation graphique synthétique de ces relations (diagramme de Sankey et dendrogramme).",
                     key="ui_analyse_descriptive",
                 )
 
@@ -249,7 +250,7 @@ def render_pipeline_form() -> bool:
                 help='Le brief n\'est pris en compte que si "Avec brief" est sélectionné.',
             )
 
-            with st.expander("Paramètres de l'analyse", expanded=True):
+            with st.expander("Paramètres de l'analyse", expanded=False):
                 st.caption(
                     "Valeurs utilisées par le pipeline auto. Vous pouvez les ajuster avant lancement."
                 )
@@ -331,12 +332,12 @@ def render_pipeline_form() -> bool:
                     )
 
                 st.checkbox(
-                    "Activer Sankey / Crosstabs lourds",
+                    "Analyse détaillée des tris croisés",
                     key="run_sankey_crosstabs",
                 )
 
                 st.checkbox(
-                    "Générer des graphiques de distribution",
+                    "Analyse détaillée de la distribution des variables",
                     key="generate_distribution_figures",
                 )
 
@@ -367,7 +368,7 @@ def run():
     diag = _run_diagnostics(df)
     st.session_state["pipeline_diagnostics"] = diag
     prep_tasks = _suggest_preparation_tasks(df, diag)
-    st.subheader("Traitements de préparation suggérés")
+    st.subheader("Traitements de préparation à réaliser")
     st.markdown("\n".join([f"- {t}" for t in prep_tasks]))
     if st.session_state.get("verbatim_only_dataset"):
         st.info("Dataset 100% verbatim détecté : seule la synthèse des verbatims sera exécutée.")
