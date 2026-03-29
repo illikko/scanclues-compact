@@ -42,6 +42,10 @@ Dans chaque module métier, structurer le code en 3 blocs :
 ### 3.4 Encodage et langue (FR prioritaire)
 - L'application est destinée à des francophones : les caractères spéciaux (é, è, ê, à, ç, ï, etc.) doivent être conservés et correctement affichés dans l'interface et les artefacts.
 - Ne pas "simplifier" les libellés en retirant les accents, sauf demande explicite.
+- Lire et écrire tous les fichiers texte en UTF-8.
+- Conserver exactement les caractères existants lors des copier/coller vers ou depuis l’application.
+- Ne jamais convertir des caractères comme é, è, à, ç, œ, €, ’, “ ”, — en versions corrompues.
+- Si un texte venant de l’application contient des caractères déjà corrompus, s’arrêter et le signaler au lieu de le réimporter.
 - Upload : accepter plusieurs encodages, avec priorité pratique à `latin-1` pour les fichiers utilisateurs, puis fallback (ex. `utf-8`/`cp1252`) selon l'implémentation du module d'import.
 - Exports CSV destinés à Excel FR : `sep=';'` + encodage adapté (`latin-1` si requis).
 

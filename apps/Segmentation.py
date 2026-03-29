@@ -6,6 +6,7 @@ from kmodes.kmodes import KModes
 from openai import OpenAI
 import os
 import json, re
+from utils import discretize_continuous_variables
 
 
 MODE_KEY = "__NAV_MODE__"
@@ -137,11 +138,11 @@ def run():
     
     st.markdown("##### Paramètres de la segmentation")
     model_segmentation = st.selectbox("Modèles de clustering", ["Kmodes", "Kmeans", "CAH", "DBSCAN"], index=0)
-    num_quantiles = st.slider("Nombre de quantiles pour la discrétisation", min_value=3, max_value=10, value=5)
-    n_clusters = st.slider("Nombre de segments", min_value=2, max_value=20, value=10)
-    n_init = st.slider("Nombre d'itérations du Kmode", min_value=2, max_value=10, value=5)
-    high_freq_threshold = st.slider("Fréquence du mode à partir de laquelle la discrétisation est binaire", min_value=0.80, max_value=0.99, value=0.9, step=0.01)
-    distinct_threshold_continuous = st.number_input("Seuil (nb de modalités distinctes) à partir duquel une variable numérique est continue", min_value=2, max_value=20, value=5, step=1)
+    num_quantiles = st.slider("Nombre de quantiles pour la discrétisation", min_value=3, max_value=10, value=int(st.session_state.get("num_quantiles", 5)))
+    n_clusters = st.slider("Nombre de segments", min_value=2, max_value=20, value=int(st.session_state.get("n_clusters_segmentation", 10)))
+    n_init = st.slider("Nombre d'itérations du Kmode", min_value=2, max_value=10, value=int(st.session_state.get("kmodes_n_init", 2)))
+    high_freq_threshold = st.slider("Fréquence du mode à partir de laquelle la discrétisation est binaire", min_value=0.50, max_value=0.99, value=float(st.session_state.get("high_freq_threshold", 0.90)), step=0.01)
+    distinct_threshold_continuous = st.number_input("Seuil (nb de modalités distinctes) à partir duquel une variable numérique est continue", min_value=2, max_value=20, value=int(st.session_state.get("distinct_threshold_continuous", 5)), step=1)
 
     proceed = False
     if mode == "automatique":
@@ -151,111 +152,57 @@ def run():
             proceed = True
 
     if proceed:
-        # discrétisation
-        num_cols = df.select_dtypes(include=['number'])
-        distinct_counts = num_cols.nunique()
-        continuous = distinct_counts[distinct_counts > distinct_threshold_continuous].index
-        discrete = [col for col in df.columns if col not in continuous]
+        df_prepared, info = discretize_continuous_variables(
+            df,
+            num_quantiles=int(num_quantiles),
+            mod_freq_min=float(high_freq_threshold),
+            distinct_threshold_continuous=int(distinct_threshold_continuous),
+            context_name="segmentation",
+        )
+        df = df_prepared.copy()
 
-        # convertir les variables discrètes en str
-        for var in discrete:
-            if df[var].dtypes in ["int64", "float64"]:
-                df[var] = df[var].astype(str)
-
-        # traitement des variables continues à haute fréquence du mode
-        cols_high_freq = []
-        freq_rows = []
-
-        for col in continuous:
-            # Valeur dominante et fréquence (sur la colonne d'origine)
-            mode_value = df[col].mode(dropna=True).iloc[0]
-            mod_freq = df[col].value_counts(normalize=True, dropna=False).loc[mode_value]
-
-            if mod_freq > high_freq_threshold:
-                # Masque calculé AVANT conversion en string (sinon bug comparaison string vs numérique)
-                mask_mode = df[col].eq(mode_value)
-
-                # Gestion du cas où il n'y a aucune valeur "autre"
-                if (~mask_mode).sum() == 0:
-                    dominant_label = str(mode_value)
-                    other_label = "others (none)"
-                    df[col] = df[col].astype("string")
-                    df[col] = dominant_label
-                else:
-                    non_mode = df.loc[~mask_mode, col]
-                    min_value = non_mode.min()
-                    max_value = non_mode.max()
-
-                    dominant_label = str(mode_value)
-                    other_label = f"{min_value} to {max_value}"
-
-                    df[col] = df[col].astype("string")
-                    df.loc[mask_mode, col] = dominant_label
-                    df.loc[~mask_mode, col] = other_label
-
-                cols_high_freq.append(col)
-
-                # Fréquences des 2 modalités après transformation
-                vc = df[col].value_counts(normalize=True, dropna=False)
-                freq_rows.append({
-                    "variable": col,
-                    "modalité dominante": dominant_label,
-                    "fréquence modalité dominante": float(vc.get(dominant_label, 0.0)),
-                    "autres valeurs": other_label,
-                    "fréquence autres valeurs": float(vc.get(other_label, 0.0)),
-                })
-        if freq_rows:
+        collapsed = info.get("collapsed_meta", {})
+        if collapsed:
+            freq_rows = []
+            for col, meta in collapsed.items():
+                freq_rows.append(
+                    {
+                        "variable": col,
+                        "modalité dominante": meta.get("dominant_label"),
+                        "fréquence modalité dominante": meta.get("dominant_freq"),
+                        "autres valeurs": meta.get("other_label"),
+                        "fréquence autres valeurs": meta.get("other_freq"),
+                    }
+                )
             freq_table = pd.DataFrame(freq_rows).sort_values("fréquence modalité dominante", ascending=False)
             st.subheader("Variables continues à haute fréquence du mode")
             st.dataframe(freq_table, use_container_width=True)
 
-        # discretisation en bins
-        continuous = [col for col in continuous if col not in cols_high_freq]
-        bins_by_col = {}
-
-        for col in continuous:
-            q, bins = pd.qcut(df[col], num_quantiles, retbins=True, labels=False, duplicates='drop')
-            bins = [round(b, 2) for b in bins]
-            quantile_labels = [f"({bins[i]}, {bins[i+1]}]" for i in range(len(bins) - 1)]
-            df[col] = q.map(dict(enumerate(quantile_labels)))
-            bins_by_col[col] = quantile_labels
-        
-        
-        # --- Construire le tableau récapitulatif d'affichage ---
+        bins_by_col = info.get("bins_by_col", {})
         rows = []
-        for col in continuous:
+        for col in bins_by_col:
             s = df[col]
-
             row = {
                 "Variable": col,
                 "NA (n)": int(s.isna().sum()),
                 "NA (%)": round(float(s.isna().mean() * 100), 1),
             }
-
             labels = bins_by_col.get(col, [])
-
-            # tableau récapitulatif des intervalles de la discrétisation
-            for i in range(num_quantiles):
-                row[f"Bin_{i+1}"] = labels[i] if i < len(labels) else ""
-
+            for i in range(len(labels)):
+                row[f"Bin_{i+1}"] = labels[i]
             rows.append(row)
 
-        bins_table = pd.DataFrame(rows)
-
-        # ordre des colonnes
         bin_cols = [f"Bin_{i+1}" for i in range(num_quantiles)]
         cols = ["Variable", "NA (n)", "NA (%)"] + bin_cols
-        bins_table = pd.DataFrame(rows)
+        bins_table = pd.DataFrame(rows, columns=cols)
 
         if bins_table.empty:
             st.info("Aucune variable continue à discrétiser (seulement des booléennes 0/1).")
-            bins_table = pd.DataFrame(columns=cols)
+            st.session_state.bins_table = pd.DataFrame(columns=cols)
         else:
-            bins_table = bins_table[cols]
-        
-        st.session_state.bins_table = bins_table
-        st.write("Aperçu du dataset discrétisé:")
-        st.dataframe(df.head())
+            st.session_state.bins_table = bins_table
+            st.write("Aperçu du dataset discrétisé:")
+            st.dataframe(df.head())
     
     if st.session_state.bins_table is not None:
         st.subheader("Intervalles (bins) générés par variable")
@@ -513,6 +460,7 @@ def run():
 
     st.write("Vous pouvez lancer la prochaine étape dans le menu à gauche: Profils associés à une cible.")
     st.session_state["etape30_terminee"] = True
+
 
 
 

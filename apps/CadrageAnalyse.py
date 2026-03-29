@@ -428,68 +428,7 @@ def run():
 
 
     # Paramètres de l'analyse (2/2)
-    
-    with st.expander("Paramètres de l'analyse 2/2"):
-        if "outliers_percent_target" not in st.session_state:
-            st.session_state["outliers_percent_target"] = 0.01
-        st.slider(
-            "Pourcentage d'outliers (contamination)",
-            min_value=0.0, 
-            max_value=20.0, 
-            value=st.session_state.outliers_percent_target, 
-            step=0.1,
-            key = "outliers_percent_target",
-            help="Choisissez la contamination (en %)"
-        )
-
-        if "distinct_threshold_continuous" not in st.session_state:
-            st.session_state["distinct_threshold_continuous"] = 5
-        st.number_input(
-            "Seuil (nb de modalités distinctes) à partir duquel une variable NUMÉRIQUE est CONTINUE",
-            min_value=2, max_value=20, value=5,
-            step=1,
-            key = "distinct_threshold_continuous"
-        )
-        
-        if "num_quantiles" not in st.session_state:
-            st.session_state["num_quantiles"] = 5
-        st.slider(
-            "Nombre de quantiles pour la discrétisation",
-            min_value=2, max_value=20, value=5, 
-            key="num_quantiles"
-        )
-        
-        if "mod_freq_min" not in st.session_state:
-            st.session_state["mod_freq_min"] = 0.9
-        st.slider(
-            "Fréquence du mode à partir de laquelle la discrétisation est binaire",
-            min_value=0.80, max_value=0.99, value=0.9, step=0.01, 
-            key="mod_freq_min"
-        )
-
-        if "n_clusters_segmentation" not in st.session_state:
-            st.session_state["n_clusters_segmentation"] = 10
-        st.slider(
-            "Nombre de segments pour le profiling de la population",
-            min_value=2, max_value=20, value=10, step=1, 
-            key="n_clusters_segmentation"
-        )
-
-        if "n_clusters_target" not in st.session_state:
-            st.session_state["n_clusters_target"] = 3
-        st.slider(
-            "Nombre de segments pour le profiling de la cible",
-            min_value=2, max_value=15, value=3, step=1, 
-            key="n_clusters_target"
-        )
-        
-        if "kmodes_n_init" not in st.session_state:
-            st.session_state["kmodes_n_init"] = 2
-        st.slider(
-            "Nombre d'itérations du Kmode", 
-            min_value=2, max_value=20, value=2, step=1,
-            key="kmodes_n_init"
-        )
+    st.caption("Les paramètres techniques sont désormais configurés dans Diagnostic Global (expander \"Paramètres de l'analyse 2/2\").")
 
     # 4) Définition de la question clé (manuel)
     st.header("Orientation de l'analyse")

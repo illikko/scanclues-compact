@@ -5,6 +5,7 @@ from pandas.api.types import is_numeric_dtype
 from kmodes.kmodes import KModes
 from openai import OpenAI
 import os
+from utils import discretize_continuous_variables
 
 MODE_KEY = "__NAV_MODE__"
 
@@ -317,54 +318,14 @@ def run():
         st.warning("Segment cible vide. Ajuste la cible / modalité / segment puis relance.")
         return
 
-    # Discrétisation simple (comme ta version) :
-    Xw = X.copy()
-    
-    
-    mod_freq_min = float(st.session_state.get("mod_freq_min", 0.90))
-
-    num_cols = Xw.select_dtypes(include=["number"])
-    distinct_counts = num_cols.nunique(dropna=True)
-    continuous = distinct_counts[distinct_counts > int(st.session_state.get("distinct_threshold_continuous", 5))].index.tolist()
-    discrete = [col for col in Xw.columns if col not in continuous]
-
-    # Cast numériques discrets en str
-    for var in discrete:
-        if Xw[var].dtype.kind in ("i", "f"):
-            Xw[var] = Xw[var].astype(str)
-
-    # Variables continues très concentrées -> binaire (mode vs reste)
-    col_high_freq = []
-    for col in continuous:
-        if Xw[col].dropna().empty:
-            continue
-        mode_value = Xw[col].mode(dropna=True).iloc[0]
-        mod_freq = Xw[col].value_counts(normalize=True, dropna=True).loc[mode_value]
-        if mod_freq > mod_freq_min:
-            non_mode = Xw[col] != mode_value
-            
-            Xw[col] = Xw[col].astype("string") # conversion en string avant affectation
-            
-            if non_mode.any():
-                min_value = Xw.loc[non_mode, col].min()
-                max_value = Xw.loc[non_mode, col].max()
-                Xw.loc[non_mode, col] = f"{round(float(min_value), 2)} to {round(float(max_value), 2)}"
-            Xw.loc[~non_mode, col] = f"{mode_value}"
-            col_high_freq.append(col)
-
-    continuous = [c for c in continuous if c not in col_high_freq]
-
-    # Discrétisation quantiles
-    qn = int(st.session_state.num_quantiles)
-    for col in continuous:
-        col_series = Xw[col]
-        if col_series.dropna().nunique() < 2:
-            Xw[col] = col_series.astype("string")
-            continue
-        codes, bins = pd.qcut(col_series, qn, retbins=True, labels=False, duplicates="drop")
-        bins = [round(float(b), 2) for b in bins]
-        labels = [f"({bins[i]}, {bins[i+1]}]" for i in range(len(bins) - 1)]
-        Xw[col] = codes.map(dict(enumerate(labels))).astype("string")
+    # Discrétisation centralisée (utils.discretize_continuous_variables)
+    Xw, _info = discretize_continuous_variables(
+        X,
+        num_quantiles=int(st.session_state.get("num_quantiles", 5)),
+        mod_freq_min=float(st.session_state.get("mod_freq_min", 0.90)),
+        distinct_threshold_continuous=int(st.session_state.get("distinct_threshold_continuous", 5)),
+        context_name="profils_y",
+    )
 
     st.caption("Aperçu des variables explicatives après discrétisation :")
     st.dataframe(Xw.head())
@@ -576,5 +537,3 @@ def run():
 
     st.session_state["etape31_terminee"] = True
     st.success("Étape terminée. Tu peux relancer avec d'autres paramètres ou passer au suivant.")
-
-

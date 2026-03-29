@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 from core.df_registry import DFState, get_df, set_df
+from utils import preparation_process
 
 # ========= OpenAI =========
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))

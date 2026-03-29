@@ -558,6 +558,39 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
     st.session_state["__PIPELINE_SILENT__"] = True
     st.session_state.pop("pipeline_sankey_context_error", None)
 
+    # Shortcut verbatim-only : si toutes les colonnes sont des textes longs (hors identifiants),
+    # on ne lance que VerbatimSummary et on ignore le reste.
+    if st.session_state.get("verbatim_only_dataset"):
+        verb_logs: list[dict] = []
+        st.session_state["pipeline_selection"] = {
+            "preparation": True,
+            "profilage": False,
+            "analyse_descriptive": False,
+        }
+        if _ready_for("VerbatimSummary"):
+            _run_module(VerbatimSummary, "VerbatimSummary", verb_logs, progress_callback=progress_callback, function_progress_callback=function_progress_callback)
+        else:
+            verb_logs.append(_skip_entry("VerbatimSummary"))
+
+        elapsed = time.monotonic() - t0
+        st.session_state["pipeline_execution_logs"] = verb_logs
+        st.session_state["pipeline_execution_seconds"] = float(elapsed)
+        st.session_state["pipeline_executed"] = True
+        st.session_state["pipeline_current_module"] = None
+        st.session_state["pipeline_status"] = "completed" if all(x.get("status") == "ok" for x in verb_logs) else "completed_with_skips"
+        st.session_state["pipeline_halt"] = None
+        # Préparer des synthèses minimales pour le rapport final
+        st.session_state.setdefault("data_preparation_synthesis", "Jeu de données composé uniquement de verbatims; aucun autre module exécuté.")
+        if st.session_state.get("syntheses_verbatim"):
+            st.session_state["global_synthesis"] = "Analyse verbatim uniquement — voir synthèse ci-dessous."
+        else:
+            st.session_state.setdefault("global_synthesis", "Analyse verbatim uniquement — synthèse indisponible (aucun texte généré).")
+        st.session_state["__PIPELINE_SILENT__"] = False
+        st.session_state[PIPELINE_FORCE_AUTO_KEY] = prev_force
+        if show_details:
+            st.dataframe(verb_logs, use_container_width=True)
+        return verb_logs
+
     prep_base = [
         (VerbatimSummary, "VerbatimSummary"),
         (LabelShortening, "LabelShortening"),

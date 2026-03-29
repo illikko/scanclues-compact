@@ -284,6 +284,9 @@ def run():
         "pipeline_selection",
         {"preparation": True, "profilage": False, "analyse_descriptive": False},
     )
+    # Forcer la régénération du rapport si dataset 100% verbatim
+    if st.session_state.get("verbatim_only_dataset"):
+        st.session_state["final_report_ready"] = False
 
     defaults = {
         'dataset_object': None,                      
@@ -349,7 +352,7 @@ def run():
     crosstabs_interpretation = st.session_state.get("crosstabs_interpretation", {})
     sankey_pair_results = st.session_state.get("sankey_pair_results", {})
     tm = st.session_state.get("target_modalities", {})
-    syntheses_verbatim = st.session_state.get("syntheses_verbatim", {})
+    syntheses_verbatim = st.session_state.get("syntheses_verbatim")
         
     # import des CSVs non encore importés
     df_ready = st.session_state.get('df_ready')
@@ -369,6 +372,7 @@ def run():
     ):
         st.session_state["final_report_ready"] = False
         st.session_state["final_export_zip_bytes"] = None
+        st.session_state["__PIPELINE_LABEL_REFRESHED__"] = False
 
         def _render_progress():
             module_name = st.session_state.get("pipeline_current_module", "")
@@ -406,8 +410,8 @@ def run():
             skipped_names = {x.get("module") for x in skipped}
             if skipped_names and skipped_names.issubset({"DiagramSankey"}):
                 st.info(
-                    "Execution pipeline terminee. "
-                    "DiagramSankey non execute (variables cibles/illustratives non disponibles)."
+                    "Exécution pipeline terminée. "
+                    "DiagramSankey non exécuté (variables cibles/illustratives non disponibles)."
                 )
             else:
                 st.warning("Execution pipeline terminee avec modules ignores (voir logs).")
@@ -427,9 +431,13 @@ def run():
         sankey_latents = st.session_state.get("sankey_latents")
         fig_dendro = st.session_state.get("dendrogram")
 
+        if not st.session_state.get("__PIPELINE_LABEL_REFRESHED__", False):
+            st.session_state["__PIPELINE_LABEL_REFRESHED__"] = True
+            st.rerun()
+
     logs = st.session_state.get("pipeline_execution_logs", [])
     if logs:
-        with st.expander("Logs execution pipeline", expanded=False):
+        with st.expander("Logs d'exécution des modules", expanded=False):
             st.write("Variables cibles:", st.session_state.get("target_variables", []))
             st.write("Variables illustratives:", st.session_state.get("illustrative_variables", []))
             logs_df = pd.DataFrame(logs)
@@ -439,6 +447,22 @@ def run():
             elapsed = st.session_state.get("pipeline_execution_seconds")
             if isinstance(elapsed, (int, float)):
                 st.write("Temps execution pipeline (s):", round(float(elapsed), 2))
+
+    verb_cols = st.session_state.get("verbatim_candidates", [])
+    verb_ids = st.session_state.get("verbatim_identifier_cols", [])
+
+    # Affichage de la synthèse verbatim uniquement si des colonnes verbatim sont détectées
+    if verb_cols or st.session_state.get("verbatim_only_dataset"):
+        with st.expander("Synthèse des verbatims", expanded=False):
+            if syntheses_verbatim:
+                st.text_area("Résumé", syntheses_verbatim, height=320)
+            elif st.session_state.get("verbatim_only_dataset"):
+                st.info("Dataset 100% verbatim : synthèse absente ou non générée.")
+            else:
+                st.info("Aucune synthèse verbatim disponible pour ce run.")
+            st.caption(f"Colonnes verbatim détectées : {len(verb_cols)} | Identifiants ignorés : {len(verb_ids)}")
+            if verb_cols:
+                st.write(", ".join(map(str, verb_cols)))
 
     # Contexte LLM minimal si absent.
     if isinstance(df_ready, pd.DataFrame) and (
@@ -711,9 +735,24 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     if prep_selected:
         with st.expander("Etapes des préparations", expanded=False):
             if isinstance(process, pd.DataFrame):
-                st.dataframe(process, use_container_width=True)
+                proc = process.copy()
+                if verb_cols:
+                    synth_row = {
+                        "Etape": "Synthèse verbatims",
+                        "Nb observations": proc["Nb observations"].iloc[-1] if "Nb observations" in proc.columns else "",
+                        "Nb variables": proc["Nb variables"].iloc[-1] if "Nb variables" in proc.columns else "",
+                        "Traitement": f"Synthèse de {len(verb_cols)} colonne(s) verbatim",
+                    }
+                    proc = pd.concat([proc, pd.DataFrame([synth_row])], ignore_index=True)
+                st.dataframe(proc, use_container_width=True)
             else:
                 st.info("Aucune étape de préparation disponible.")
+            # Info verbatim si aucune synthèse
+            if not syntheses_verbatim:
+                if st.session_state.get("verbatim_only_dataset"):
+                    st.info("Étape verbatim : dataset 100% texte, synthèse absente ou non générée.")
+                elif verb_cols:
+                    st.info(f"Étape verbatim : {len(verb_cols)} colonne(s) texte traitée(s).")
     # =============================================================
     # GENERATION DU HTML
     # =============================================================
@@ -759,8 +798,10 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                     )
                     _rf_add_text(T136, interpretation)      
 
-        if syntheses_verbatim is not None:
-            _rf_add_text(T15, st.session_state.get("syntheses_verbatim"))  
+        if syntheses_verbatim:
+            _rf_add_text(T15, syntheses_verbatim)
+        elif st.session_state.get("verbatim_only_dataset"):
+            _rf_add_text(T15, "Dataset 100% verbatim détecté, mais aucune synthèse n'a été générée.")
 
         if profils_y_text is not None:
             _rf_add_text(T21, st.session_state.get("profils_y_text"))
@@ -937,7 +978,6 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             html = _css + html + extra
 
         st.session_state["final_report_html"] = html    
-        st.success("HTML report generated.")
 
         # =============================================================
         # CONSTRUCTION DU PACKETS DE FICHIERS

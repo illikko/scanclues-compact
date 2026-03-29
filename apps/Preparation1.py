@@ -236,12 +236,12 @@ def run():
        
     with st.expander("A propos de l'application", expanded=False):
         st.write("""
-            L'application scanClues permet de traiter les jeux de données tabulaires (fichiers CSV, excel), plus particulièrement de:
-            - préparer le jeu de données brut (nettoyage (données manquantes, anormales, doublons,...), et de l'enrichir (textes, dates, géolocalisation,...))
-            - analyser la distribution et la relation entre les variables
+            L'application scanClues permet de traiter les jeux de données tabulaires (fichiers CSV, excel), plus particulièrement:
+            - de préparer le jeu de données brut (nettoyage (données manquantes, anormales, doublons,...), et de l'enrichir (textes, dates, géolocalisation,...))
+            - d'analyser la distribution et la relation entre les variables
             - d'extraire des insights et des recommandations: profiling sur tout le jeu de données et sur une cible, de mesurer pour chaque segment les actions qui ont le plus d'impact sur la cible.
-            - fournir un rapport HTML et des fichiers csv qui résument les analyses et insights extraits.
-            - poser des questions sur l'analyse réalisée
+            - de fournir un rapport HTML et des fichiers csv qui résument les analyses et insights extraits.
+            - de poser des questions sur l'analyse réalisée
             
             L'utilisateur doit intervenir à plusieurs étapes pour:
             1- vérifier que le jeu de données correspond au format attendu (voir plus bas)\n
@@ -250,9 +250,8 @@ def run():
             3- lire l'analyse dans l'application et/ou la télécharger (fichiers HTML et CSVs), 
             4- poser des questions.\n
             
-            Par défaut l'application exécute les 19 modules (qui défilent dans le menu à gauche) et produit une analyse standard.
+            Par défaut l'application exécute les 19 modules (dont le titre défile en haut de page) et produit une analyse standard.
             L'icône en haut à droite indique si un traitement est en cours: il faut attendre quelques minutes entre les étapes 2- et 3-, puis 3- et 4-.
-            Basculer en mode manuel avant le téléchargement du fichier zip (étape 4-).
                           
             L'application est particulièrement adaptée aux cas d'usage suivants : enquêtes, analyses marketing (CRM, web analytics...), RH (satisfaction, attrition...), open data, etc.
             
@@ -305,7 +304,7 @@ def run():
                 df = pd.read_csv(uploaded_file, sep=";", encoding=encoding_choice)
 
             st.session_state.df = df
-            st.success("Fichier telecharge.")
+            st.success("Fichier téléchargé.")
             st.write("#### Aperçu du jeu de données :", df)
         except Exception as e:
             st.error(f"Error loading file : {e}")

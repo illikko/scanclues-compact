@@ -1,9 +1,76 @@
-﻿import pandas as pd
+import pandas as pd
 import streamlit as st
 
 from core.df_registry import DFState, get_df
 from .ReponsesMultiples import detect_multimodal_config
 from .ReponsesMultiplesOrdonnees import detect_ranked_groups
+from .VerbatimSummary import detect_long_text_columns
+from utils import ensure_analysis_params
+
+
+def _verbatim_only_dataset(df: pd.DataFrame | None) -> tuple[bool, list[str], list[str]]:
+    """
+    Détecte un dataset 100% verbatims (hors colonnes identifiants éventuelles).
+    On s'appuie sur la typologie issue de Preparation1 (df_semantic_types) quand disponible,
+    sinon on retombe sur une détection simple longueurs/unicité.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return False, [], []
+
+    sem = st.session_state.get("df_semantic_types")
+    if isinstance(sem, pd.DataFrame) and not sem.empty and {"name", "semantic_type"} <= set(sem.columns):
+        sem_ok = sem.copy()
+        verb_cols = sem_ok.loc[sem_ok["semantic_type"] == "long_text", "name"].astype(str).tolist()
+        id_cols = sem_ok.loc[sem_ok["semantic_type"] == "identifier", "name"].astype(str).tolist()
+        other_cols = [
+            str(n)
+            for n in sem_ok["name"].astype(str).tolist()
+            if n not in verb_cols + id_cols
+        ]
+        only_verbs = bool(verb_cols) and len(other_cols) == 0
+        return only_verbs, verb_cols, id_cols
+
+    # Fallback : toutes les colonnes sont longues selon heuristique
+    candidates, _ = detect_long_text_columns(df, min_avg_len=50, min_unique_ratio=0.7)
+    only_verbs = bool(candidates) and len(candidates) == len(df.columns)
+    return only_verbs, candidates, []
+
+
+def _init_session_state() -> None:
+    """Initialise toutes les clés nécessaires au module."""
+    defaults = {
+        "etape2_terminee": False,
+        "pipeline_selection": {
+            "preparation": True,
+            "profilage": False,
+            "analyse_descriptive": False,
+        },
+        "pipeline_ready_to_run": False,
+        "pipeline_diagnostics": {},
+        "dataset_key_questions_value": "",
+        "dataset_key_questions_mode": "sb",
+        "dataset_key_questions_saved": False,
+        "pipeline_executed": False,
+        "pipeline_status": None,
+        "pipeline_halt": None,
+        "final_report_ready": False,
+        "final_export_zip_bytes": None,
+        "pipeline_config": None,
+        "num_quantiles": 5,
+        "distinct_threshold_continuous": 5,
+        "mod_freq_min": 0.90,
+        "correlation_threshold_v": 0.75,
+        "outliers_percent_target": 1.0,
+        "n_clusters_segmentation": 10,
+        "n_clusters_target": 3,
+        "kmodes_n_init": 2,
+        "high_freq_threshold": 0.90,
+        "run_sankey_crosstabs": False,
+        "generate_distribution_figures": False,
+    }
+
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
 
 def _get_input_df() -> pd.DataFrame | None:
@@ -28,7 +95,6 @@ def _run_diagnostics(df: pd.DataFrame) -> dict:
     ranked_groups = detect_ranked_groups(df, min_ranks=2)
     multi_det = detect_multimodal_config(df)
 
-    # Proxy robuste pour "manquantes structurelles candidates".
     missing_cols = int((df.isna().sum() > 0).sum())
     skip_candidates_count = max(missing_cols, len(ranked_groups))
 
@@ -43,101 +109,284 @@ def _run_diagnostics(df: pd.DataFrame) -> dict:
     }
 
 
+def _suggest_preparation_tasks(df: pd.DataFrame, diag: dict) -> list[str]:
+    """Construit la liste des tâches de préparation à afficher."""
+    tasks: list[str] = []
+
+    # Cas 100% verbatims (hors identifiants) : on court-circuite les autres modules
+    verb_only, verb_cols, id_cols = _verbatim_only_dataset(df)
+    st.session_state["verbatim_only_dataset"] = verb_only
+    if verb_only:
+        count_txt = len(verb_cols)
+        count_id = len(id_cols)
+        tasks.append(f"Synthèse des verbatims (jeu 100% texte – {count_txt} colonnes verbatim, {count_id} identifiants ignorés)")
+        st.session_state["verbatim_candidates"] = verb_cols
+        st.session_state["verbatim_identifier_cols"] = id_cols
+        return tasks
+    else:
+        st.session_state.pop("verbatim_only_dataset", None)
+
+    if diag.get("label_too_long_count", 0) > 0:
+        too_long = diag.get("label_too_long_count", 0)
+        limit = 50
+        tasks.append(f"Raccourcir les libellés trop longs ({too_long} colonne(s) > {limit} caractères)")
+
+    missing_pct = diag.get("missing_pct", 0.0)
+    tasks.append(f"Traiter les valeurs manquantes (~{missing_pct:.1f}% manquantes)")
+
+    if diag.get("ranked_groups_count", 0) > 0:
+        tasks.append("Identifier et traiter les réponses ordinales/multiples ordonnées")
+
+    if diag.get("multi_detected", False):
+        tasks.append("Traiter les réponses multiples (séparateur détecté)")
+
+    # Détection verbatim : nombre de colonnes texte longues
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        candidates, _ = detect_long_text_columns(df, min_avg_len=50, min_unique_ratio=0.7)
+        if candidates:
+            st.session_state["verbatim_candidates"] = candidates
+            tasks.append(f"Synthèse des verbatims ({len(candidates)} colonne(s) texte détectée(s))")
+
+    # Modules toujours exécutés
+    tasks.append("Détection des valeurs aberrantes")
+    tasks.append("Variables trop corrélées (NMI)")
+
+    # dédoublonnage
+    return list(dict.fromkeys(tasks))
+
+
+def validate_pipeline_form() -> bool:
+    """Valide les choix utilisateur. Affiche les erreurs et retourne True si OK."""
+    brief_mode = st.session_state.get("dataset_key_questions_mode", "sb")
+    brief = st.session_state.get("dataset_key_questions_value", "")
+
+    if brief_mode == "ab" and not str(brief).strip():
+        st.error("Le brief est obligatoire en mode « Avec brief ».")
+        return False
+
+    pipeline_selection = st.session_state.get("pipeline_selection", {})
+    if not any(pipeline_selection.values()):
+        st.error("Sélectionnez au moins un bloc de traitements.")
+        return False
+
+    return True
+
+
+def get_pipeline_config() -> dict:
+    """Construit une config propre à transmettre au pipeline."""
+    return {
+        "pipeline_selection": st.session_state["pipeline_selection"].copy(),
+        "num_quantiles": st.session_state["num_quantiles"],
+        "distinct_threshold_continuous": st.session_state["distinct_threshold_continuous"],
+        "mod_freq_min": st.session_state["mod_freq_min"],
+        "correlation_threshold_v": st.session_state["correlation_threshold_v"],
+        "outliers_percent_target": st.session_state["outliers_percent_target"],
+        "n_clusters_segmentation": st.session_state["n_clusters_segmentation"],
+        "n_clusters_target": st.session_state["n_clusters_target"],
+        "kmodes_n_init": st.session_state["kmodes_n_init"],
+        "high_freq_threshold": st.session_state["high_freq_threshold"],
+        "run_sankey_crosstabs": st.session_state["run_sankey_crosstabs"],
+        "generate_distribution_figures": st.session_state["generate_distribution_figures"],
+        "dataset_key_questions_mode": st.session_state["dataset_key_questions_mode"],
+        "dataset_key_questions_value": st.session_state["dataset_key_questions_value"],
+    }
+
+
+def render_pipeline_form() -> bool:
+    """Affiche le formulaire. Les widgets écrivent directement dans session_state."""
+    st.subheader("Choix des traitements à réaliser")
+
+    with st.container(border=True):
+        with st.form("pipeline_form", clear_on_submit=False):
+            col1, col2, col3 = st.columns(3)
+
+            current_selection = st.session_state.get(
+                "pipeline_selection",
+                {
+                    "preparation": True,
+                    "profilage": False,
+                    "analyse_descriptive": False,
+                },
+            )
+
+            with col1:
+                st.checkbox(
+                    "Preparation",
+                    value=bool(current_selection.get("preparation", True)),
+                    help="Inclut : Preparation2, PreparationCorrelations, Outliers, CodificationOrdinales",
+                    key="ui_preparation",
+                )
+
+            with col2:
+                st.checkbox(
+                    "Profilage",
+                    value=bool(current_selection.get("profilage", False)),
+                    help="Inclut : Segmentation, Profils_y",
+                    key="ui_profilage",
+                )
+
+            with col3:
+                st.checkbox(
+                    "Analyse descriptive",
+                    value=bool(current_selection.get("analyse_descriptive", False)),
+                    key="ui_analyse_descriptive",
+                )
+
+            st.subheader("Brief (optionnel)")
+            brief_mode = st.radio(
+                "Mode brief",
+                options=["sb", "ab"],
+                format_func=lambda x: "Sans brief" if x == "sb" else "Avec brief",
+                horizontal=True,
+                key="dataset_key_questions_mode",
+            )
+            st.text_area(
+                "Saisir le brief d'analyse",
+                key="dataset_key_questions_value",
+                value=st.session_state.get("dataset_key_questions_value", ""),
+                placeholder="Ex : identifier les profils les plus liés à la satisfaction élevée et proposer 3 actions prioritaires.",
+                height=120,
+                help='Le brief n\'est pris en compte que si "Avec brief" est sélectionné.',
+            )
+
+            with st.expander("Paramètres de l'analyse", expanded=True):
+                st.caption(
+                    "Valeurs utilisées par le pipeline auto. Vous pouvez les ajuster avant lancement."
+                )
+
+                colp1, colp2 = st.columns(2)
+
+                with colp1:
+                    st.number_input(
+                        "Nombre de quantiles (discrétisation)",
+                        min_value=2,
+                        max_value=20,
+                        step=1,
+                        key="num_quantiles",
+                    )
+
+                    st.number_input(
+                        "Seuil nb modalités pour les variables continues",
+                        min_value=2,
+                        max_value=50,
+                        step=1,
+                        key="distinct_threshold_continuous",
+                    )
+
+                    st.slider(
+                        "Fréquence mini du mode (binarisation)",
+                        min_value=0.50,
+                        max_value=0.99,
+                        step=0.01,
+                        key="mod_freq_min",
+                    )
+
+                    st.slider(
+                        "Seuil V de Cramer (corrélations fortes)",
+                        min_value=0.50,
+                        max_value=0.95,
+                        step=0.01,
+                        key="correlation_threshold_v",
+                    )
+
+                    st.slider(
+                        "Pourcentage d'outliers (contamination)",
+                        min_value=0.0,
+                        max_value=20.0,
+                        step=0.1,
+                        key="outliers_percent_target",
+                    )
+
+                with colp2:
+                    st.number_input(
+                        "Clusters segmentation (Kmodes)",
+                        min_value=2,
+                        max_value=50,
+                        step=1,
+                        key="n_clusters_segmentation",
+                    )
+
+                    st.number_input(
+                        "Clusters profils cible",
+                        min_value=2,
+                        max_value=20,
+                        step=1,
+                        key="n_clusters_target",
+                    )
+
+                    st.number_input(
+                        "Kmodes n_init",
+                        min_value=1,
+                        max_value=20,
+                        step=1,
+                        key="kmodes_n_init",
+                    )
+
+                    st.slider(
+                        "Seuil mode dominant (segmentation)",
+                        min_value=0.50,
+                        max_value=0.99,
+                        step=0.01,
+                        key="high_freq_threshold",
+                    )
+
+                st.checkbox(
+                    "Activer Sankey / Crosstabs lourds",
+                    key="run_sankey_crosstabs",
+                )
+
+                st.checkbox(
+                    "Générer des graphiques de distribution",
+                    key="generate_distribution_figures",
+                )
+
+            submitted = st.form_submit_button("Lancer", type="primary")
+
+    st.session_state["pipeline_selection"] = {
+        "preparation": bool(st.session_state.get("ui_preparation", False)),
+        "profilage": bool(st.session_state.get("ui_profilage", False)),
+        "analyse_descriptive": bool(st.session_state.get("ui_analyse_descriptive", False)),
+    }
+
+    return submitted
+
+
 def run():
     st.title("Diagnostic Global")
 
-    st.session_state.setdefault("etape2_terminee", False)
-    st.session_state.setdefault(
-        "pipeline_selection",
-        {"preparation": True, "profilage": False, "analyse_descriptive": False},
-    )
-    st.session_state.setdefault("pipeline_ready_to_run", False)
-    st.session_state.setdefault("pipeline_diagnostics", {})
-    st.session_state.setdefault("dataset_key_questions_value", "")
-    st.session_state.setdefault("dataset_key_questions_mode", "sb")  # sb=Sans brief, ab=Avec brief
+    ensure_analysis_params(st.session_state)
+    _init_session_state()
 
     df = _get_input_df()
     if not isinstance(df, pd.DataFrame):
-        st.warning("Aucun dataset disponible. Lancez d'abord l'etape Upload.")
+        st.warning("Aucun dataset disponible. Lancez d'abord l'étape Upload.")
         st.stop()
 
-    st.success(f"Dataset charge: {df.shape[0]} lignes x {df.shape[1]} colonnes")
+    st.success(f"Dataset chargé : {df.shape[0]} lignes x {df.shape[1]} colonnes")
 
     diag = _run_diagnostics(df)
     st.session_state["pipeline_diagnostics"] = diag
-
-    st.subheader("Taches a realiser")
-    with st.expander("Voir le diagnostic de preparation detecte", expanded=False):
-        if diag["label_too_long_count"] > 0:
-            st.warning(f"Raccourcissement des libelles: {diag['label_too_long_count']} colonnes.")
-        if diag["missing_pct"] > 0:
-            st.warning(f"Valeurs manquantes detectees: {diag['missing_pct']:.2f}%.")
-        if diag["ranked_groups_count"] > 0:
-            st.warning(f"Reponses multiples ordonnees detectees: {diag['ranked_groups_count']} groupes.")
-        if diag["multi_detected"]:
-            st.warning(f"Reponses multiples detectees (separateur probable: {diag['multi_sep']}).")
-        if diag["skip_candidates_count"] > 0:
-            st.warning(
-                f"Manquantes structurelles candidates: {diag['skip_candidates_count']} relations."
-            )
-        if (
-            diag["label_too_long_count"] == 0
-            and diag["missing_pct"] == 0
-            and diag["ranked_groups_count"] == 0
-            and not diag["multi_detected"]
-            and diag["skip_candidates_count"] == 0
-        ):
-            st.info("Aucune tache de preparation detectee.")
-
-    st.subheader("Choix des traitements a realiser")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.session_state["pipeline_selection"]["preparation"] = st.checkbox(
-            "Preparation",
-            value=st.session_state["pipeline_selection"]["preparation"],
-            help="Inclut: Preparation2, PreparationCorrelations, Outliers, CodificationOrdinales",
-        )
-    with col2:
-        st.session_state["pipeline_selection"]["profilage"] = st.checkbox(
-            "Profilage",
-            value=st.session_state["pipeline_selection"]["profilage"],
-            help="Inclut: Segmentation, Profils_y",
-        )
-    with col3:
-        st.session_state["pipeline_selection"]["analyse_descriptive"] = st.checkbox(
-            "Analyse descriptive",
-            value=st.session_state["pipeline_selection"]["analyse_descriptive"],
+    prep_tasks = _suggest_preparation_tasks(df, diag)
+    st.subheader("Traitements de préparation suggérés")
+    st.markdown("\n".join([f"- {t}" for t in prep_tasks]))
+    if st.session_state.get("verbatim_only_dataset"):
+        st.info("Dataset 100% verbatim détecté : seule la synthèse des verbatims sera exécutée.")
+    if diag.get("label_too_long_cols"):
+        sample_cols = ", ".join(diag["label_too_long_cols"][:5])
+        st.caption(
+            f"Exemples de libellés longs: {sample_cols}"
+            + (" ..." if len(diag["label_too_long_cols"]) > 5 else "")
         )
 
-    st.subheader("Brief (optionnel)")
-    brief_mode = st.radio(
-        "Mode brief",
-        options=["sb", "ab"],
-        format_func=lambda x: "Sans brief" if x == "sb" else "Avec brief",
-        index=0 if st.session_state.get("dataset_key_questions_mode", "sb") == "sb" else 1,
-        horizontal=True,
-        key="dataset_key_questions_mode",
-    )
+    submitted = render_pipeline_form()
 
-    brief = st.session_state.get("dataset_key_questions_value", "")
-    if brief_mode == "ab":
-        brief = st.text_area(
-            "Saisir le brief d'analyse",
-            value=st.session_state.get("dataset_key_questions_value", ""),
-            placeholder="Ex: identifier les profils les plus lies a la satisfaction elevee et proposer 3 actions prioritaires.",
-            height=120,
-        )
-
-    if st.button("Lancer", type="primary"):
-        if brief_mode == "ab" and not str(brief).strip():
-            st.error("Le brief est obligatoire en mode 'Avec brief'.")
+    if submitted:
+        if not validate_pipeline_form():
             st.stop()
 
-        if not any(st.session_state["pipeline_selection"].values()):
-            st.error("Sélectionnez au moins un bloc de traitements.")
-            st.stop()
+        config = get_pipeline_config()
+        st.session_state["pipeline_config"] = config
 
-        st.session_state["dataset_key_questions_value"] = str(brief).strip() if brief_mode == "ab" else ""
         st.session_state["dataset_key_questions_saved"] = True
         st.session_state["pipeline_ready_to_run"] = True
         st.session_state["pipeline_executed"] = False
@@ -146,4 +395,5 @@ def run():
         st.session_state["final_report_ready"] = False
         st.session_state["final_export_zip_bytes"] = None
         st.session_state["etape2_terminee"] = True
-        st.success("Selection enregistree. Passez au Rapport Final.")
+
+        st.success("Sélection enregistrée. Passez au Rapport Final.")

@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+from scipy.stats import chi2_contingency
 
 
 def _to_list_of_str(x):
@@ -49,6 +51,8 @@ def ensure_analysis_params(state):
     state.setdefault("distinct_threshold_continuous", 5)
     state.setdefault("num_quantiles", 5)
     state.setdefault("mod_freq_min", 0.90)
+    state.setdefault("correlation_threshold_nmi", 0.70)
+    state.setdefault("nmi_normalization_method", "min")
     state.setdefault("n_clusters_segmentation", 10)
     state.setdefault("n_clusters_target", 3)
     state.setdefault("kmodes_n_init", 2)
@@ -96,6 +100,8 @@ def discretize_continuous_variables(
         "errors": [],
         "cols": {},
         "stats": {},
+        "bins_by_col": {},
+        "collapsed_meta": {},
     }
 
     # ---- garde-fous non bloquants sur les paramètres ----
@@ -203,8 +209,19 @@ def discretize_continuous_variables(
                     min_value = s.loc[non_mode].min()
                     max_value = s.loc[non_mode].max()
                     X.loc[non_mode, col] = f"{min_value} to {max_value}"
+                    other_label = f"{min_value} to {max_value}"
+                else:
+                    other_label = "others (none)"
                 X.loc[~non_mode, col] = f"{mode_value}"
                 collapsed_cols.append(col)
+
+                vc_after = X[col].value_counts(normalize=True, dropna=False)
+                info["collapsed_meta"][col] = {
+                    "dominant_label": str(mode_value),
+                    "dominant_freq": float(vc_after.get(str(mode_value), 0.0)),
+                    "other_label": other_label,
+                    "other_freq": float(vc_after.get(other_label, 0.0)),
+                }
 
         # Supprimer les collapsed du set continu
         continuous_after = [c for c in continuous if c not in collapsed_cols]
@@ -242,6 +259,7 @@ def discretize_continuous_variables(
             mapping = dict(enumerate(labels))
 
             X[col] = codes.map(mapping)
+            info["bins_by_col"][col] = labels
 
             # Si NaN apparaissent (ex. NA dans s), on remplace
             if X[col].isna().any():
