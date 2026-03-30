@@ -61,14 +61,23 @@ def run():
     }
 
     with st.spinner("Calcul des dépendances (NMI) ..."):
-        corr_matrix, corr_info = _cached_correlation_matrix_nmi(
-            df.copy(),
-            num_bins=params["num_bins"],
-            distinct_threshold_continuous=params["distinct_threshold_continuous"],
-            normalization_method=params["normalization_method"],
-            context_name="preparation_correlations_nmi",
-        )
-        st.session_state["correlation_info"] = corr_info
+        try:
+            corr_matrix, corr_info = _cached_correlation_matrix_nmi(
+                df.copy(),
+                num_bins=params["num_bins"],
+                distinct_threshold_continuous=params["distinct_threshold_continuous"],
+                normalization_method=params["normalization_method"],
+                context_name="preparation_correlations_nmi",
+            )
+            st.session_state["correlation_info"] = corr_info
+        except Exception as exc:
+            st.session_state["pipeline_halt"] = {
+                "module": "PreparationCorrelations",
+                "cause": "error",
+                "error": str(exc),
+            }
+            st.error(f"Erreur lors du calcul des corrélations NMI : {exc}")
+            return
 
         upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
 
