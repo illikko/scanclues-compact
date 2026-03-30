@@ -18,6 +18,12 @@ def run():
     generate_distribution_figures = bool(
         st.session_state.get("generate_distribution_figures", not pipeline_silent)
     )
+
+    # Éviter les doublons en mode pipeline silencieux (DistributionsDetail produit déjà les figures)
+    if pipeline_silent:
+        st.session_state.setdefault("figs_variables_distribution", [])
+        st.session_state["figs_variables_distribution"] = st.session_state.get("figs_variables_distribution", [])
+        return
     
     st.header("Analyse de la distribution des variables")
 
@@ -283,7 +289,6 @@ def run():
 
     st.write("Vous pouvez lancer la prochaine étape dans le menu à gauche: Analyse des corrélations.")
     st.session_state["etape14_terminee"] = True
-
 
 
 

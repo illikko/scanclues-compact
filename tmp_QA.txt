@@ -1,0 +1,436 @@
+import streamlit as st
+import pandas as pd
+from openai import OpenAI
+import json
+import os
+from apps.CrosstabsDetail import run as run_crosstabs_detail
+from apps.DistributionsDetail import run as run_distributions_detail
+from core.correlations_utils import discretize_series_quantiles, fill_missing_for_discrete
+from utils import discretize_continuous_variables
+from apps.DiagramSankey import crosstab_with_std_residuals, crosstab_heatmap_png
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+def val_or_default(val, default):
+    """Retourne default si val est None, chaîne vide, ou pandas vide; sinon val."""
+    if val is None:
+        return default
+    if isinstance(val, str):
+        return val if val.strip() else default
+    if isinstance(val, (pd.DataFrame, pd.Series)):
+        return val if not val.empty else default
+    # pour listes/dicts, optionnel : if hasattr(val, "__len__") and len(val)==0: return default
+    return val
+
+def to_text(x):
+    """Sérialise pour le prompt."""
+    if isinstance(x, pd.DataFrame):
+        return x.to_csv(index=False)
+    if isinstance(x, pd.Series):
+        return x.to_csv(index=True)
+    return str(x)
+
+
+def _find_cols_in_question(question: str, df: pd.DataFrame) -> list[str]:
+    if not isinstance(df, pd.DataFrame):
+        return []
+    qlow = question.lower()
+    cols = []
+    for c in df.columns:
+        if str(c).lower() in qlow:
+            cols.append(str(c))
+    return cols
+
+
+def _get_crosstab_interpretation(var_a: str, var_b: str) -> str | None:
+    items = st.session_state.get("crosstabs_interpretation", []) or []
+    for it in items:
+        xa = str(it.get("var_x"))
+        ya = str(it.get("var_y"))
+        if {xa, ya} == {var_a, var_b}:
+            return it.get("interpretation")
+    return None
+
+
+def _discretize_for_display(s: pd.Series, n_bins: int):
+    """
+    Discrétise en quantiles et renvoie des labels lisibles (ex: [0.0,1.2]).
+    Fallback: rangs en quantiles si qcut échoue.
+    """
+    s_num = fill_missing_for_discrete(s)  # remplit NA par 'Manquant' pour non-numériques; ok pour num car converti plus bas
+    try:
+        cat = pd.qcut(pd.to_numeric(s_num, errors="coerce"), q=max(2, n_bins), duplicates="drop")
+        return cat.astype(str).fillna("Manquant")
+    except Exception:
+        try:
+            ranks = pd.to_numeric(s_num, errors="coerce").rank(method="average")
+            cat = pd.qcut(ranks, q=max(2, n_bins), duplicates="drop")
+            return cat.astype(str).fillna("Manquant")
+        except Exception:
+            return discretize_series_quantiles(s, n_bins=n_bins).astype(str)
+
+
+def _summarize_crosstab(df: pd.DataFrame, var_a: str, var_b: str, top: int = 5):
+    try:
+        n_bins = max(3, min(12, int(st.session_state.get("num_quantiles", top if top > 2 else 5))))
+        df_subset = df[[var_a, var_b]].copy()
+        df_prepared, _info = discretize_continuous_variables(
+            df_subset,
+            num_quantiles=st.session_state.get("num_quantiles", n_bins),
+            mod_freq_min=st.session_state.get("mod_freq_min", 0.9),
+            distinct_threshold_continuous=st.session_state.get("distinct_threshold_continuous", 5),
+            context_name="qa_crosstab",
+        )
+
+        if isinstance(df_prepared, pd.DataFrame):
+            s1 = df_prepared[var_a]
+            s2 = df_prepared[var_b]
+        else:
+            s1 = df_subset[var_a]
+            s2 = df_subset[var_b]
+
+        # Discrétisation finale : la préparation renvoie déjà des str, mais on garde
+        # le fallback quantiles si une série reste numérique.
+        if pd.api.types.is_numeric_dtype(s1):
+            s1 = _discretize_for_display(s1, n_bins=n_bins)
+        else:
+            s1 = fill_missing_for_discrete(s1).astype(str)
+        if pd.api.types.is_numeric_dtype(s2):
+            s2 = _discretize_for_display(s2, n_bins=n_bins)
+        else:
+            s2 = fill_missing_for_discrete(s2).astype(str)
+
+        ct = pd.crosstab(s1, s2)
+        # Limiter aux modalités les plus fréquentes pour chaque axe
+        top_a = s1.value_counts().head(top).index
+        top_b = s2.value_counts().head(top).index
+        ct = ct.loc[ct.index.isin(top_a), ct.columns.isin(top_b)]
+        total = ct.sum().sum()
+        row_pct = (ct.div(ct.sum(axis=1), axis=0) * 100).round(1)
+        col_pct = (ct.div(ct.sum(axis=0), axis=1) * 100).round(1)
+        # Mesure simple d’association (phi² normalisé) si possible
+        assoc = ""
+        try:
+            chi = pd.crosstab(df[var_a], df[var_b])
+            chi_val = chi.values
+            import numpy as np
+            from math import sqrt
+
+            chi2 = (((chi_val - chi_val.sum(axis=1)[:, None] * chi_val.sum(axis=0)[None, :] / chi_val.sum()) ** 2) /
+                    (chi_val.sum(axis=1)[:, None] * chi_val.sum(axis=0)[None, :] / chi_val.sum())).sum()
+            n = chi_val.sum()
+            phi2 = chi2 / max(n, 1)
+            r, c = chi_val.shape
+            cramerv = sqrt(phi2 / max(min(r - 1, c - 1), 1))
+            assoc = f"Force d'association (approx.): Cramér V = {cramerv:.2f}"
+        except Exception:
+            pass
+        # Mise en forme Markdown pour lisibilité
+        try:
+            row_md = row_pct.reset_index().rename(columns={"index": var_a}).to_markdown(index=False)
+            col_md = col_pct.reset_index().rename(columns={"index": var_a}).to_markdown(index=False)
+        except Exception:
+            row_md = row_pct.to_string()
+            col_md = col_pct.to_string()
+
+        # Heatmap cohérente avec CrosstabsDetail
+        heatmap_png = None
+        try:
+            df_tmp = df.copy()
+            df_tmp[var_a] = s1
+            df_tmp[var_b] = s2
+            ct_count, ct_pct_row_full, std_res = crosstab_with_std_residuals(df_tmp, var_a, var_b)
+            heatmap_png = crosstab_heatmap_png(
+                ct_pct_row_full,
+                std_res,
+                title=f"{var_a} vs {var_b}",
+            )
+        except Exception:
+            heatmap_png = None
+
+        # Texte d'interprétation déjà calculé par CrosstabsDetail si dispo
+        interp = _get_crosstab_interpretation(var_a, var_b)
+
+        summary = f"Tableau croisé (top {top} modalités) **{var_a} x {var_b}** — total {int(total)} obs."
+        return {
+            "summary": summary,
+            "row_pct_md": row_md,
+            "col_pct_md": col_md,
+            "assoc": assoc,
+            "row_df": row_pct.reset_index(),
+            "col_df": col_pct.reset_index(),
+            "vars": (var_a, var_b),
+            "heatmap_png": heatmap_png,
+            "interpretation": interp,
+        }
+    except Exception as e:
+        return {"error": f"Impossible de calculer le croisement {var_a} x {var_b}: {e}"}
+
+
+def _summarize_distribution(series: pd.Series) -> str:
+    s = series.dropna()
+    if s.empty:
+        return "Série vide."
+    if pd.api.types.is_numeric_dtype(s):
+        desc = s.describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9]).to_dict()
+        skew = s.skew()
+        kurt = s.kurt()
+        zero_pct = (s == 0).mean() * 100
+        return (
+            f"nb={int(desc['count'])}, moy={desc['mean']:.2f}, écart-type={desc['std']:.2f}, "
+            f"min={desc['min']:.2f}, p10={desc['10%']:.2f}, médiane={desc['50%']:.2f}, p90={desc['90%']:.2f}, max={desc['max']:.2f}, "
+            f"skew={skew:.2f}, kurt={kurt:.2f}, %0={zero_pct:.1f}%"
+        )
+    # Discrète
+    counts = s.value_counts(normalize=True)
+    gini = 1 - (counts ** 2).sum()
+    top = counts.head(5).apply(lambda x: f"{x*100:.1f}%").to_dict()
+    return f"modalités={len(counts)}, Gini={gini:.2f}, top5={top}"
+
+
+def _render_compact_answer(question: str, df_ready: pd.DataFrame):
+    if not isinstance(df_ready, pd.DataFrame) or df_ready.empty:
+        return None
+    ql = question.lower()
+    cols_in_q = _find_cols_in_question(question, df_ready)
+    outputs = []
+
+    # Si deux variables repérées ou demande de relation
+    if len(cols_in_q) >= 2 or any(k in ql for k in ("crosstab", "croisé", "relation", "impact", "comparaison")):
+        vars_pair = cols_in_q[:2] if len(cols_in_q) >= 2 else list(df_ready.columns[:2])
+        a, b = vars_pair[0], vars_pair[1]
+        outputs.append(("ct", _summarize_crosstab(df_ready, a, b)))
+        # ajouter les distributions des deux variables si dispo
+        for col in (a, b):
+            outputs.append(("dist-sum", f"{col}: {_summarize_distribution(df_ready[col])}"))
+
+    # Si demande d'histogrammes/distribution
+    if any(k in ql for k in ("histogram", "distribution", "répartition", "décile", "quantile", "top décile")):
+        targets = cols_in_q if cols_in_q else list(df_ready.columns[:3])
+        for col in targets[:3]:
+            outputs.append(("dist", f"{col}: {_summarize_distribution(df_ready[col])}"))
+
+    return outputs if outputs else None
+
+
+def _ensure_artifacts(question: str, df_ready: pd.DataFrame | None = None):
+    ql = question.lower()
+    need_crosstab = any(k in ql for k in ("crosstab", "croisé", "relation", "impact", "comparaison"))
+    need_dist = any(k in ql for k in ("histogram", "distribution", "répartition", "décile", "quantile", "top décile"))
+    if need_crosstab:
+        st.session_state["__QA_FORCE_CROSSTABS__"] = True
+        st.session_state["run_sankey_crosstabs"] = True
+        run_crosstabs_detail()
+    if need_dist:
+        st.session_state["generate_distribution_figures"] = True
+        run_distributions_detail()
+
+
+def _render_artifacts():
+    rendered = False
+    ct_items = st.session_state.get("crosstabs_interpretation", []) or []
+    for item in ct_items:
+        st.markdown(f"**{item.get('var_x')} vs {item.get('var_y')}**")
+        st.write(item.get("interpretation", ""))
+        img_bytes = item.get("heatmap_png")
+        if isinstance(img_bytes, (bytes, bytearray, memoryview)):
+            st.image(img_bytes)
+        rendered = True
+    dist_items = st.session_state.get("figs_variables_distribution_detailed") or st.session_state.get("figs_variables_distribution") or []
+    for item in dist_items:
+        st.markdown(f"**{item.get('title','Distribution')}**")
+        img_bytes = item.get("png")
+        if isinstance(img_bytes, (bytes, bytearray, memoryview)):
+            st.image(img_bytes)
+            rendered = True
+    return rendered
+
+
+def summarize_sankey_pairs(results_store, max_items: int = 20):
+    """Resume sankey_pair_results pour payload LLM (compact)."""
+    if not isinstance(results_store, dict) or not results_store:
+        return []
+
+    rows = []
+    for pair_id, r in results_store.items():
+        interp = str(r.get("interpretation", "") or "").strip()
+        if len(interp) > 500:
+            interp = interp[:500] + "..."
+        rows.append(
+            {
+                "pair_id": pair_id,
+                "var_x": r.get("var_x"),
+                "var_y": r.get("var_y"),
+                "v": r.get("v"),
+                "p": r.get("p"),
+                "chi2": r.get("chi2"),
+                "interpretation": interp,
+            }
+        )
+
+    rows.sort(key=lambda x: float(x.get("v") or 0), reverse=True)
+    return rows[:max_items]
+
+def run():
+    # États init
+    st.session_state.setdefault("profil_dominant", None)
+    st.session_state.setdefault("profils", None)
+    st.session_state.setdefault("interpretationACM", None)
+
+    # Récupération des données (sans 'or' ambigu)
+    dataset_object = st.session_state.get('dataset_object')
+    dataset_context = st.session_state.get('dataset_context')
+    dataset_recommendations = st.session_state.get('dataset_recommendations')
+    key_questions_answer = st.session_state.get('key_questions_answer')
+    target_profiles_text = st.session_state.get('target_profiles_text')
+    profil_dominant_analysis = st.session_state.get('profil_dominant_analysis')
+    dominant_continues = st.session_state.get('dominant_continues')
+    dominant_discretes = st.session_state.get('dominant_discretes')
+    interpretationACM = st.session_state.get('interpretationACM')
+    dendrogram_interpretation = st.session_state.get('dendrogram_interpretation')
+    latent_summary_text = st.session_state.get('latent_summary_text')
+    fig_dendro = st.session_state.get('dendrogram')
+    segmentation_profiles_text = st.session_state.get('segmentation_profiles_text')
+    target_profiles_table = st.session_state.get('target_profiles_table')
+    segmentation_profiles_table = st.session_state.get('segmentation_profiles_table')
+    segmentation_detailed_profiles = st.session_state.get('segmentation_detailed_profiles')
+    ctas_rules_text = st.session_state.get('ctas_rules_text')
+    process = st.session_state.get('process')
+    figs_variables_distribution = st.session_state.get("figs_variables_distribution", [])
+    dataset_characteristics  = st.session_state.get("dataset_characteristics")
+    variables_raw = st.session_state.get("variables_raw")
+    data_preparation_synthesis = st.session_state.get("data_preparation_synthesis")    
+    fig_missing_percentages = st.session_state.get("fig_missing_percentages")
+    fig_missing_correlation_heatmap = st.session_state.get("fig_missing_correlation_heatmap")
+    fig_missing_correlation_dendrogram = st.session_state.get("fig_missing_correlation_dendrogram")
+    little_test_result = st.session_state.get("little_test_result")
+    df_ready = st.session_state.get("df_ready")
+    sankey_interpretation_synthesis = st.session_state.get("sankey_interpretation_synthesis")
+    raw_crosstabs = st.session_state.get("crosstabs_interpretation") or []
+    crosstabs_interpretation = []
+    for item in raw_crosstabs:
+        try:
+            crosstabs_interpretation.append({
+                "var_x": item.get("var_x"),
+                "var_y": item.get("var_y"),
+                "interpretation": item.get("interpretation", ""),
+            })
+        except Exception:
+            continue
+    sankey_pair_results = st.session_state.get("sankey_pair_results", {})
+    sankey_latents = st.session_state.get("sankey_latents")
+    global_synthesis = st.session_state.get("global_synthesis")
+ 
+    st.header("Q&A")
+
+    # Saisie
+    question = st.text_input("Posez une question sur un aspect spécifique posé par le jeu de données :")
+
+    if st.button("Envoyer"):
+        if not question.strip():
+            st.warning("Veuillez poser une question.")
+            return
+
+        try:
+            _ensure_artifacts(question, df_ready)
+            compact = _render_compact_answer(question, df_ready)
+            if compact:
+                for kind, payload in compact:
+                    if kind == "ct":
+                        if isinstance(payload, dict) and payload.get("error"):
+                            st.warning(payload["error"])
+                        else:
+                            # heatmap si disponible (même rendu que Sankey/Crosstabs)
+                            if payload.get("heatmap_png"):
+                                st.markdown("**Carte de chaleur du crosstab**")
+                                st.image(payload["heatmap_png"])
+                            st.markdown(payload["summary"])
+                            if payload.get("assoc"):
+                                st.caption(payload["assoc"])
+                            st.caption("Lecture : vert = surreprésentation, rouge = sous-représentation par rapport à l’indépendance (résidus standardisés, après discrétisation éventuelle des variables continues).")
+                            # tenter d'afficher les histogrammes existants pour les variables concernées
+                            dist_items = st.session_state.get("figs_variables_distribution_detailed") or st.session_state.get("figs_variables_distribution") or []
+                            for var in payload.get("vars", []):
+                                for item in dist_items:
+                                    title = str(item.get("title", "")).lower()
+                                    if var.lower() in title:
+                                        st.markdown(f"**Distribution de {var}**")
+                                        img_bytes = item.get("png")
+                                        if isinstance(img_bytes, (bytes, bytearray, memoryview)):
+                                            st.image(img_bytes)
+                            if payload.get("interpretation"):
+                                st.markdown("**Interprétation**")
+                                st.write(payload["interpretation"])
+                            else:
+                                st.markdown("**Interprétation**")
+                                st.write("Les zones vertes indiquent des surreprésentations, les rouges des sous-représentations par rapport à l’indépendance (résidus standardisés du khi²).")
+                    elif kind in ("dist", "dist-sum"):
+                        st.markdown(f"*Distribution synthétique* : {payload}")
+                return
+            # Détection de variables dans la question et déclenchement auto des crosstabs si 2 variables trouvées
+            cols_in_q = _find_cols_in_question(question, df_ready)
+            if len(cols_in_q) >= 2:
+                var_a, var_b = cols_in_q[0], cols_in_q[1]
+                if _get_crosstab_interpretation(var_a, var_b) is None:
+                    # Exécuter CrosstabsDetail pour générer les interprétations
+                    run_crosstabs_detail()
+                interp = _get_crosstab_interpretation(var_a, var_b)
+                if interp:
+                    st.text_area("Réponse (tris croisés auto) :", interp, height=300)
+                    return
+
+            with st.spinner("Analyse de la question par LLM en cours..."):
+                
+                sys_ctx_6 = f'''Vous êtes un expert en analyse de données, en marketing s'il s'agit de questionnaires. Réponds  en français, clair et concis.
+                        Une analyse détaillée a été réalisée sur un jeu de données.
+                        Les résultats vous sont fournis dans plusieurs documents :
+                        profil dominant, personas de la segmentation, et interprétation de l'ACM,...
+                        Une question vous a été posée: {question}                    
+                        Commencez par répondre en vous limitant au jeu de données , en premier et c'est la priorité, de celles qui s'appuient sur des données externes. Au besoin séparez en 2 parties distinctes.
+                '''
+
+                preview = df_ready.head(10).to_csv(index=False)
+                preview = preview[:20000]  # limiter la taille
+
+                payload = {
+                    "columns": [str(c) for c in df_ready.columns],
+                    "data_sample_preview_as_csv": preview,
+                }
+
+                context_blob5 = {
+                    **payload,
+                    "dataset_object": dataset_object,
+                    "dataset_context": dataset_context,
+                    "dataset_recommendations": dataset_recommendations,
+                    "target_profiles_text": target_profiles_text,
+                    "profil_dominant_analysis": profil_dominant_analysis,
+                    "interpretationACM": interpretationACM,
+                    "latent_summary_text": latent_summary_text,
+                    "segmentation_profiles_text": segmentation_profiles_text,
+                    "key_questions_answer": key_questions_answer,
+                    "data_preparation_synthesis": data_preparation_synthesis,
+                    "dendrogram_interpretation" : dendrogram_interpretation,
+                    "ctas_rules_text": ctas_rules_text,
+                    "global_synthesis": global_synthesis,
+                    "sankey_interpretation_synthesis": sankey_interpretation_synthesis,
+                    "crosstabs_interpretation": crosstabs_interpretation,
+                    "sankey_pair_results_summary": summarize_sankey_pairs(sankey_pair_results, max_items=20),
+                    "sankey_latents_csv": to_text(sankey_latents) if isinstance(sankey_latents, pd.DataFrame) else "",
+                }
+
+                user_content = json.dumps(context_blob5, ensure_ascii=False, default=str)
+
+                r6 = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    temperature=0,
+                    messages=[
+                        {"role": "system", "content": sys_ctx_6},
+                        {"role": "user", "content": user_content},
+                    ],
+                )
+
+                answer = r6.choices[0].message.content
+                st.text_area("Réponse :", answer, height=300)
+
+        except Exception as e:
+            st.error(f"Erreur d'appel à l'API OpenAI : {e}")

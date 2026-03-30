@@ -125,6 +125,23 @@ def _rf_add_image(title: str, img, intro: str | None = None, dpi: int = 120):
 """
     st.session_state.setdefault("_rf_blocks", []).append(block)
 
+
+def _rf_add_collapsible(title: str, inner_html: str):
+    """Ajoute un bloc repliable (<details>) pour les contenus détaillés."""
+    if not inner_html:
+        return
+    title = _html.escape(title or "")
+    block = f"""
+<section style="margin:24px 0">
+  <details style="background:#fafafa;border:1px solid #ddd;border-radius:6px;padding:12px">
+    <summary style="cursor:pointer;font-weight:600;font-size:16px">{title}</summary>
+    <div style="margin-top:12px">{inner_html}</div>
+  </details>
+</section>
+"""
+    st.session_state.setdefault("_rf_blocks", []).append(block)
+
+
 def _rf_add_sankey(title: str, sankey_base64: str, intro: str | None = None):
     """Ajoute un diagramme Sankey en base64"""
     if not sankey_base64:
@@ -273,6 +290,9 @@ mpl.rcParams.update({
 # Application principale
 # ================================================================
 def run():
+    # Réinitialiser les blocs/flags de section détaillée à chaque exécution
+    st.session_state["_rf_blocks"] = []
+    st.session_state["__DETAIL_SECTION_ADDED__"] = False
     mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
     
     # Initialisation des états
@@ -486,6 +506,18 @@ def run():
     prep_selected = bool(selection.get("preparation", True))
     profilage_selected = bool(selection.get("profilage", False))
     descriptive_selected = bool(selection.get("analyse_descriptive", False))
+    # Harmoniser avec les clés des checkboxes de DiagnosticGlobal et forcer l'affichage
+    # si des artefacts existent déjà en session (évite de masquer les résultats produits).
+    sankey_crosstabs_selected = bool(
+        st.session_state.get("run_sankey_crosstabs", selection.get("sankey_crosstabs", False))
+        or st.session_state.get("sankey_pair_results")
+        or st.session_state.get("crosstabs_interpretation")
+    )
+    distribution_figures_selected = bool(
+        st.session_state.get("generate_distribution_figures", selection.get("distribution_figures", False))
+        or st.session_state.get("figs_variables_distribution")
+        or st.session_state.get("figs_variables_distribution_detailed")
+    )
     show_insights = profilage_selected or descriptive_selected
     show_technical_text = descriptive_selected
 
@@ -555,19 +587,26 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 if dataset_key_questions_mode == "ab" and str(dataset_key_questions or "").strip():
                     global_synthesis_prompt = "\n".join([
                         "Vous etes un expert en analyse de donnees. Repondez en francais, clair et concis.",
-                        "Produisez les principaux insights et recommandations en priorisant la question metier du brief (dataset_key_questions).",
-                        "Appuyez-vous sur les elements d'analyse fournis (profils, segmentation, ACM, dendrogramme, sankey/crosstabs, contexte).",
-                        f"La cible analysee est definie par: {tm}.",
-                        "Format attendu: bullet points, puis limites, puis pistes d'approfondissement.",
+                        "Suivez strictement ces etapes :",
+                        "1) Verifiez si les artefacts fournis (profils_y, segmentation, ACM, dendrogramme, sankey/crosstabs, contexte) suffisent pour repondre.",
+                        "2) Reperez dans dataset_key_questions et dans 'columns' les variables du dataset (limitez-vous aux noms fournis) et leur role (target_variables, illustrative_variables).",
+                        "3) Choisissez les modules pertinents (profils_y, tris croises, distributions, analyse descriptive) pour repondre a la question.",
+                        "4) Si un module permet de repondre, synthesez les resultats sans inventer de nouvelles variables ou scores.",
+                        "5) Si les donnees sont insuffisantes, dites-le explicitement et proposez uniquement ce qui est supporte par les artefacts.",
+                        "6) Format: bullet points d'abord, puis limites et pistes d'approfondissement.",
+                        "Brief utilisateur : dataset_key_questions (prioritaire si present).",
                         "Terminez par: 'Tous les details complementaires sont disponibles dans l'analyse complete.'",
                     ])
                 else:
                     global_synthesis_prompt = "\n".join([
                         "Vous etes un expert en analyse de donnees. Repondez en francais, clair et concis.",
-                        "Produisez les principaux insights et recommandations a partir des analyses disponibles.",
-                        "(profils, segmentation, ACM, dendrogramme, sankey/crosstabs, contexte), sans brief utilisateur.",
-                        f"La cible analysee est definie par: {tm}.",
-                        "Format attendu: bullet points, puis limites, puis pistes d'approfondissement.",
+                        "Suivez strictement ces etapes :",
+                        "1) Verifiez si les artefacts fournis (profils_y, segmentation, ACM, dendrogramme, sankey/crosstabs, contexte) suffisent pour repondre.",
+                        "2) Reperez dans 'columns' les variables du dataset et leur role (target_variables, illustrative_variables).",
+                        "3) Choisissez les modules pertinents (profils_y, tris croises, distributions, analyse descriptive) pour repondre.",
+                        "4) Si un module permet de repondre, synthesez les resultats sans inventer de nouvelles variables ou scores.",
+                        "5) Si les donnees sont insuffisantes, dites-le explicitement et proposez uniquement ce qui est supporte par les artefacts.",
+                        "6) Format: bullet points d'abord, puis limites et pistes d'approfondissement.",
                         "Terminez par: 'Tous les details complementaires sont disponibles dans l'analyse complete.'",
                     ])
 
@@ -579,11 +618,24 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                     "data_sample_preview_as_csv": preview,
                 }
 
+                # Sanitize crosstabs to avoid huge payloads (drop images / heavy matrices)
+                raw_ct = st.session_state.get("crosstabs_interpretation", []) or []
+                crosstabs_light = []
+                for item in raw_ct:
+                    try:
+                        crosstabs_light.append({
+                            "var_x": item.get("var_x"),
+                            "var_y": item.get("var_y"),
+                            "interpretation": item.get("interpretation", ""),
+                        })
+                    except Exception:
+                        continue
+
                 context_blob_global_synthesis = {
                     **payload,
                     "dataset_object": dataset_object,
                     "dataset_context": dataset_context,
-                    "crosstabs_interpretation": crosstabs_interpretation,
+                    "crosstabs_interpretation": crosstabs_light,
                     "sankey_interpretation_synthesis": st.session_state.get("sankey_interpretation_synthesis", ""),
                     "latent_summary_text": st.session_state.get("latent_summary_text", ""),
                     "interpretationACM": interpretationACM,
@@ -690,6 +742,8 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     latent_text = str(st.session_state.get("latent_summary_text") or "").strip()
     has_latent_df = isinstance(sankey_latents, pd.DataFrame) and not sankey_latents.empty
     has_descriptive_content = has_sankey or bool(sankey_text) or bool(acm_text) or bool(dendro_text) or bool(fig_dendro) or bool(latent_text) or has_latent_df
+
+
     if descriptive_selected:
         with st.expander("Analyse descriptive", expanded=False):
             if has_descriptive_content:
@@ -722,15 +776,74 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 llm_err = str(st.session_state.get("diagram_sankey_llm_error") or "").strip()
                 if llm_err:
                     st.error(f"Erreur LLM DiagramSankey: {llm_err}")
+                    
     if descriptive_selected:
         with st.expander("Contexte du jeu de données", expanded=False):
             st.markdown(st.session_state.get("dataset_object", "Aucune synthèse disponible"))
             st.markdown(st.session_state.get("dataset_recommendations", ""))
 
+        # Tris croisés détaillés (si cochés dans DiagnosticGlobal)
+        if sankey_crosstabs_selected:
+            results_store = st.session_state.get("sankey_pair_results", {})
+            crosstab_list = st.session_state.get("crosstabs_interpretation", [])
+            if (isinstance(results_store, dict) and results_store) or crosstab_list:
+                with st.expander("Tris croisés détaillés", expanded=False):
+                    if isinstance(results_store, dict) and results_store:
+                        pairs_sorted = sorted(results_store.items(), key=lambda kv: kv[1].get("v", 0), reverse=True)
+                        for _, res in pairs_sorted:
+                            var_x = res.get("var_x")
+                            var_y = res.get("var_y")
+                            interpretation = res.get("interpretation", "")
+                            heatmap_png = res.get("heatmap_png")
+                            if heatmap_png or interpretation:
+                                st.write(f"{T134} {var_x} - {var_y}")
+                                if isinstance(heatmap_png, str):
+                                    try:
+                                        import base64 as _b64
+                                        st.image(_b64.b64decode(heatmap_png), caption=T135)
+                                    except Exception:
+                                        st.image(heatmap_png, caption=T135)
+                                elif heatmap_png:
+                                    st.image(heatmap_png, caption=T135)
+                                if interpretation:
+                                    st.write(interpretation)
+                    elif crosstab_list:
+                        for item in crosstab_list:
+                            var_x = item.get("var_x")
+                            var_y = item.get("var_y")
+                            interpretation = item.get("interpretation", "")
+                            heatmap_png = item.get("heatmap_png")
+                            if heatmap_png or interpretation:
+                                st.write(f"{T134} {var_x} - {var_y}")
+                                if isinstance(heatmap_png, str):
+                                    try:
+                                        import base64 as _b64
+                                        st.image(_b64.b64decode(heatmap_png), caption=T135)
+                                    except Exception:
+                                        st.image(heatmap_png, caption=T135)
+                                elif heatmap_png:
+                                    st.image(heatmap_png, caption=T135)
+                                if interpretation:
+                                    st.write(interpretation)
+
     if prep_selected and descriptive_selected:
         with st.expander("Analyse technique du jeu de données", expanded=False):
             st.markdown(st.session_state.get("data_preparation_synthesis", "Aucune synthèse technique disponible"))
             st.markdown(st.session_state.get("dataset_context", ""))
+
+    # Distributions détaillées (si cochées), placées après l’analyse technique
+    if distribution_figures_selected and descriptive_selected:
+        dist_items = (
+            st.session_state.get("figs_variables_distribution", [])
+            or st.session_state.get("figs_variables_distribution_detailed", [])
+        )
+        if dist_items:
+            with st.expander("Distributions détaillées", expanded=False):
+                for item in dist_items:
+                    title = item.get("title", "Distribution")
+                    png = item.get("png", b"")
+                    st.subheader(title)
+                    st.image(png, caption="Histogramme de la distribution de la variable")
 
     if prep_selected:
         with st.expander("Etapes des préparations", expanded=False):
@@ -776,27 +889,63 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
 
         _rf_add_text("", st.session_state.get("sankey_interpretation_synthesis"))
 
-        results_store = st.session_state.get("sankey_pair_results", {})
-        if results_store:
-            pairs_sorted = sorted(
-                results_store.items(),
-                key=lambda kv: kv[1]["v"],
-                reverse=True
-            )
-            
-            for pair_id, res in pairs_sorted:
-                var_x = res["var_x"]
-                var_y = res["var_y"]
-                interpretation = res.get("interpretation", "")
-                heatmap_png = res.get("heatmap_png")
-                
-                if heatmap_png and interpretation:
-                    _rf_add_image(
-                        f"{T134} {var_x} - {var_y}",
-                        heatmap_png,
-                        intro=T135
-                    )
-                    _rf_add_text(T136, interpretation)      
+        # crosstabs (section séparée, si demandé ou si artefacts existants)
+        if sankey_crosstabs_selected:
+            results_store = st.session_state.get("sankey_pair_results", {})
+            crosstab_list = st.session_state.get("crosstabs_interpretation", [])
+            parts = []
+            import base64 as _b64
+
+            if isinstance(results_store, dict) and results_store:
+                pairs_sorted = sorted(
+                    results_store.items(),
+                    key=lambda kv: kv[1].get("v", 0),
+                    reverse=True
+                )
+                for pair_id, res in pairs_sorted:
+                    var_x = res.get("var_x")
+                    var_y = res.get("var_y")
+                    interpretation = res.get("interpretation", "")
+                    heatmap_png = res.get("heatmap_png")
+                    img_html = ""
+                    if isinstance(heatmap_png, str):
+                        b64 = heatmap_png
+                    elif isinstance(heatmap_png, (bytes, bytearray, memoryview)):
+                        b64 = _b64.b64encode(bytes(heatmap_png)).decode("ascii")
+                    else:
+                        b64 = ""
+                    if b64:
+                        img_html = f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto;border:1px solid #ddd;border-radius:4px'/>"
+                    if img_html or interpretation:
+                        parts.append(
+                            f"<div style='margin-bottom:16px'><h4 style='margin:0 0 6px 0'>{_html.escape(str(var_x))} vs {_html.escape(str(var_y))}</h4>{img_html}<pre style='white-space:pre-wrap;color:#444;margin-top:6px'>{_html.escape(str(interpretation))}</pre></div>"
+                        )
+
+            if not parts and crosstab_list:
+                for item in crosstab_list:
+                    var_x = item.get("var_x")
+                    var_y = item.get("var_y")
+                    interpretation = item.get("interpretation", "")
+                    heatmap_png = item.get("heatmap_png")
+                    img_html = ""
+                    if isinstance(heatmap_png, str):
+                        b64 = heatmap_png
+                    elif isinstance(heatmap_png, (bytes, bytearray, memoryview)):
+                        b64 = _b64.b64encode(bytes(heatmap_png)).decode("ascii")
+                    else:
+                        b64 = ""
+                    if b64:
+                        img_html = f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto;border:1px solid #ddd;border-radius:4px'/>"
+                    if img_html or interpretation:
+                        parts.append(
+                            f"<div style='margin-bottom:16px'><h4 style='margin:0 0 6px 0'>{_html.escape(str(var_x))} vs {_html.escape(str(var_y))}</h4>{img_html}<pre style='white-space:pre-wrap;color:#444;margin-top:6px'>{_html.escape(str(interpretation))}</pre></div>"
+                        )
+
+            if parts:
+                _rf_add_collapsible(
+                    "Tris croisés détaillés",
+                    "".join(parts),
+                )
 
         if syntheses_verbatim:
             _rf_add_text(T15, syntheses_verbatim)
@@ -850,17 +999,21 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 max_height="480px",
             )
         # Introduction de la section descriptive détaillée
-        _rf_add_text(T35,T351)   
-    
-        # Affichage des histogrammes de toutes les variables        
-        if "figs_variables_distribution" in st.session_state:
-            for item in st.session_state.get("figs_variables_distribution", []):
+        _rf_add_text(T35, T351)
+
+        # Affichage des histogrammes de toutes les variables (si l'option est active ou si des artefacts existent)
+        if distribution_figures_selected:
+            dist_items = (
+                st.session_state.get("figs_variables_distribution", [])
+                or st.session_state.get("figs_variables_distribution_detailed", [])
+            )
+            for item in dist_items:
                 _rf_add_image(
-                    title=item.get("title","Distribution"),
+                    title=item.get("title", "Distribution"),
                     img=item.get("png", b""),
-                    intro=T3521
+                    intro=T3521,
                 )
-    
+
         if isinstance(dominant_continues, pd.DataFrame):
             _rf_add_df(
                 T351,
@@ -868,7 +1021,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 intro=T351,
                 max_height="480px",
             )
- 
+
         if isinstance(dominant_discretes, pd.DataFrame):
             _rf_add_df(
                 T351,
@@ -876,9 +1029,8 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 intro=T351,
                 max_height="480px",
             )
-          # profil dominant
+        # profil dominant
         _rf_add_text(T352, st.session_state.get("profil_dominant_analysis"))
- 
 
         # Analyse technique du jeu de données
         _rf_add_text(T41, st.session_state.get("data_preparation_synthesis"))    
@@ -945,7 +1097,6 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 intro=T463,
                 max_height="480px",
             )
-
 
         # construction une seule fois
         html = build_html_report_with_tables(title=T100)
@@ -1097,7 +1248,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     st.subheader("Actions")
     qa_col, reset_col = st.columns(2)
     with qa_col:
-        if st.button("Aller au Q&A", use_container_width=True):
+        if st.button("Posez une question", use_container_width=True):
             try:
                 st.query_params["step"] = "4"
             except Exception:
@@ -1140,6 +1291,3 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
 
     st.session_state["etape40_terminee"] = True
     st.stop()
-
-
-

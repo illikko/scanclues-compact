@@ -11,6 +11,9 @@ import json
 import base64
 import plotly.io as pio
 
+from core.correlations_utils import DEFAULT_NUM_BINS
+from utils import discretize_continuous_variables
+
 
 MODE_KEY = "__NAV_MODE__"
 
@@ -551,14 +554,34 @@ def crosstab_with_std_residuals(df_cat, var_x, var_y):
     - ct_pct_row : % en ligne
     - std_res : résidus standardisés du Khi²
     """
-    ct_count = pd.crosstab(df_cat[var_x], df_cat[var_y])
+    if var_x not in df_cat.columns or var_y not in df_cat.columns:
+        return pd.DataFrame(), None, None
+
+    params = {
+        "num_quantiles": st.session_state.get("num_quantiles", DEFAULT_NUM_BINS),
+        "mod_freq_min": st.session_state.get("mod_freq_min", 0.9),
+        "distinct_threshold_continuous": st.session_state.get("distinct_threshold_continuous", 5),
+    }
+
+    df_local, _info = discretize_continuous_variables(
+        df_cat[[var_x, var_y]],
+        num_quantiles=params["num_quantiles"],
+        mod_freq_min=params["mod_freq_min"],
+        distinct_threshold_continuous=params["distinct_threshold_continuous"],
+        context_name="crosstab_with_std_residuals",
+    )
+
+    if not isinstance(df_local, pd.DataFrame):
+        df_local = df_cat[[var_x, var_y]].copy()
+
+    ct_count = pd.crosstab(df_local[var_x], df_local[var_y])
     if ct_count.empty:
         return ct_count, None, None
 
     chi2, p, dof, expected = chi2_contingency(ct_count)
     # résidus standardisés
     std_res = (ct_count - expected) / np.sqrt(expected)
-    ct_pct_row = pd.crosstab(df_cat[var_x], df_cat[var_y], normalize='index') * 100
+    ct_pct_row = pd.crosstab(df_local[var_x], df_local[var_y], normalize='index') * 100
     return ct_count, ct_pct_row, std_res
 
 # interprétation par LLM des tris croisés
@@ -722,6 +745,8 @@ def run():
     run_sankey_crosstabs = bool(
         st.session_state.get("run_sankey_crosstabs", not pipeline_silent)
     )
+    if pipeline_silent:
+        run_sankey_crosstabs = False
     if "etape23_terminee" not in st.session_state:
         st.session_state["etape23_terminee"] = False
 

@@ -206,6 +206,8 @@ def render_pipeline_form() -> bool:
                     "preparation": True,
                     "profilage": False,
                     "analyse_descriptive": False,
+                    "sankey_crosstabs": False,
+                    "distribution_figures": False,
                 },
             )
 
@@ -232,6 +234,20 @@ def render_pipeline_form() -> bool:
                     help="Inclut : relations statistiques et sémantique entre les variables, représentation graphique synthétique de ces relations (diagramme de Sankey et dendrogramme).",
                     key="ui_analyse_descriptive",
                 )
+
+            st.checkbox(
+                "Analyse détaillée des tris croisés",
+                value=bool(current_selection.get("sankey_crosstabs", False)),
+                help="Inclut : tris croisés détaillés pour les couples les pertinents de variables.",
+                key="run_sankey_crosstabs",
+            )
+
+            st.checkbox(
+                "Analyse détaillée de la distribution des variables",
+                value=bool(current_selection.get("distribution_figures", False)),
+                help="Inclut : les histogrammes de toutes les variables.",                
+                key="generate_distribution_figures",
+            )
 
             st.subheader("Brief (optionnel)")
             brief_mode = st.radio(
@@ -330,16 +346,6 @@ def render_pipeline_form() -> bool:
                         step=0.01,
                         key="high_freq_threshold",
                     )
-
-                st.checkbox(
-                    "Analyse détaillée des tris croisés",
-                    key="run_sankey_crosstabs",
-                )
-
-                st.checkbox(
-                    "Analyse détaillée de la distribution des variables",
-                    key="generate_distribution_figures",
-                )
 
             submitted = st.form_submit_button("Lancer", type="primary")
 

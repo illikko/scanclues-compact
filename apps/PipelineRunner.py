@@ -24,7 +24,10 @@ from . import (
     Segmentation,
     SeparationVariables,
     VerbatimSummary,
+    CrosstabsDetail,
+    DistributionsDetail,
 )
+from core.brief_agent import run_brief_agent
 
 MODE_KEY = "__NAV_MODE__"
 PIPELINE_FORCE_AUTO_KEY = "__PIPELINE_FORCE_AUTO__"
@@ -45,6 +48,8 @@ MODULE_LABELS = {
     "AnalyseFactorielle": "Analyse factorielle",
     "DiagramSankey": "Schema des relations (Sankey)",
     "DistributionVariables": "Analyse descriptive des variables",
+    "CrosstabsDetail": "Tris croises detailles",
+    "DistributionsDetail": "Distributions detaillees",
 }
 
 
@@ -516,6 +521,8 @@ def _ready_for(name: str) -> bool:
         "AnalyseCorrelations": lambda: _has_df("df_active") or _has_df("df_encoded") or _has_df("df_ready"),
         "AnalyseFactorielle": lambda: _has_df("df_active") or _has_df("df_encoded") or _has_df("df_ready"),
         "DistributionVariables": lambda: _has_df("df_ready"),
+        "CrosstabsDetail": lambda: _has_df("df_ready") and bool(st.session_state.get("run_sankey_crosstabs")),
+        "DistributionsDetail": lambda: _has_df("df_ready") and bool(st.session_state.get("generate_distribution_figures")),
     }
     fn = reqs.get(name)
     return True if fn is None else bool(fn())
@@ -540,6 +547,22 @@ def _skip_entry(name: str) -> dict:
             if st.session_state.get("pipeline_sankey_context_error"):
                 entry["context_error"] = st.session_state.get("pipeline_sankey_context_error")
         return entry
+    if name == "CrosstabsDetail":
+        return {
+            "module": name,
+            "status": "skipped",
+            "reason": "crosstabs_disabled_or_missing_df",
+            "run_sankey_crosstabs": bool(st.session_state.get("run_sankey_crosstabs")),
+            "has_df_ready": _has_df("df_ready"),
+        }
+    if name == "DistributionsDetail":
+        return {
+            "module": name,
+            "status": "skipped",
+            "reason": "distributions_disabled_or_missing_df",
+            "generate_distribution_figures": bool(st.session_state.get("generate_distribution_figures")),
+            "has_df_ready": _has_df("df_ready"),
+        }
     return {"module": name, "status": "skipped", "reason": "missing_input_df"}
 
 
@@ -557,6 +580,13 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
     st.session_state[PIPELINE_FORCE_AUTO_KEY] = True
     st.session_state["__PIPELINE_SILENT__"] = True
     st.session_state.pop("pipeline_sankey_context_error", None)
+
+    # Brief agent : active les flags/plan uniquement si le cadrage est prêt et mode 'ab'
+    try:
+        df_src = _pick_df("df_ready", "df_imputed_structural", "df_raw")
+        run_brief_agent(df_src)
+    except Exception as e:
+        st.session_state["brief_agent_error"] = str(e)
 
     # Shortcut verbatim-only : si toutes les colonnes sont des textes longs (hors identifiants),
     # on ne lance que VerbatimSummary et on ignore le reste.
@@ -614,6 +644,8 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
         (AnalyseFactorielle, "AnalyseFactorielle"),
         (DiagramSankey, "DiagramSankey"),
         (DistributionVariables, "DistributionVariables"),
+        (CrosstabsDetail, "CrosstabsDetail"),
+        (DistributionsDetail, "DistributionsDetail"),
     ]
 
     halted = False
