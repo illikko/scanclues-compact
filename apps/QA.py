@@ -8,6 +8,7 @@ from apps.CrosstabsDetail import run as run_crosstabs_detail
 from apps.DistributionsDetail import run as run_distributions_detail
 from core.correlations_utils import discretize_series_quantiles, fill_missing_for_discrete
 from core.crosstab_utils import summarize_crosstab
+from core.reset_state import reset_app_state
 from apps.DiagramSankey import (
     crosstab_with_std_residuals,
     crosstab_heatmap_png,
@@ -60,6 +61,19 @@ def _safe_json_loads(s: str) -> dict | None:
         return json.loads(s)
     except Exception:
         return None
+
+
+def _goto_step(step: str):
+    """Change d'étape sans toucher aux artefacts."""
+    st.session_state["__NAV_SELECTED__"] = str(step)
+    try:
+        st.query_params["step"] = str(step)
+    except Exception:
+        st.experimental_set_query_params(step=str(step))
+    try:
+        st.rerun()
+    except AttributeError:
+        st.experimental_rerun()
 
 
 def _get_crosstab_interpretation(var_a: str, var_b: str) -> str | None:
@@ -309,7 +323,7 @@ def run():
     sankey_latents = st.session_state.get("sankey_latents")
     global_synthesis = st.session_state.get("global_synthesis")
  
-    st.header("Q&A")
+    st.subheader("Q&A")
 
     # Saisie
     question = st.text_input("Posez une question sur un aspect spécifique posé par le jeu de données :")
@@ -317,98 +331,133 @@ def run():
     if st.button("Envoyer"):
         if not question.strip():
             st.warning("Veuillez poser une question.")
-            return
+        else:
+            try:
+                _ensure_artifacts(question, df_ready)
+                # Pilotage par LLM : plan JSON -> exécution crosstabs/distributions
+                plan = _llm_plan(
+                    question,
+                    df_ready,
+                    dataset_context,
+                    crosstabs_interpretation,
+                    sankey_pair_results,
+                    sankey_latents,
+                )
+                if plan:
+                    # notes éventuelles
+                    notes = plan.get("notes") or plan.get("comment") or ""
+                    if notes:
+                        st.markdown(f"**Notes LLM :** {notes}")
 
-        try:
-            _ensure_artifacts(question, df_ready)
-            # Pilotage par LLM : plan JSON -> exécution crosstabs/distributions
-            plan = _llm_plan(
-                question,
-                df_ready,
-                dataset_context,
-                crosstabs_interpretation,
-                sankey_pair_results,
-                sankey_latents,
-            )
-            if plan:
-                # notes éventuelles
-                notes = plan.get("notes") or plan.get("comment") or ""
-                if notes:
-                    st.markdown(f"**Notes LLM :** {notes}")
+                    # Crosstabs demandés
+                    for pair in plan.get("crosstabs", []):
+                        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                            continue
+                        var_a, var_b = str(pair[0]), str(pair[1])
+                        if var_a not in df_ready.columns or var_b not in df_ready.columns:
+                            st.warning(f"Crosstab ignoré (variables absentes) : {var_a}, {var_b}")
+                            continue
+                        interp_session = _get_crosstab_interpretation(var_a, var_b)
+                        ct_res = summarize_crosstab(
+                            df_ready,
+                            var_a,
+                            var_b,
+                            num_quantiles=st.session_state.get("num_quantiles", 5),
+                            mod_freq_min=st.session_state.get("mod_freq_min", 0.9),
+                            distinct_threshold_continuous=st.session_state.get("distinct_threshold_continuous", 5),
+                            top=5,
+                            crosstab_fn=crosstab_with_std_residuals,
+                            heatmap_fn=crosstab_heatmap_png,
+                            interpretation_fn=interpret_crosstab_with_llm if interp_session is None else None,
+                        )
+                        if interp_session:
+                            ct_res["interpretation"] = interp_session
+                        # Affichage
+                        interp_txt = ct_res.get("interpretation")
+                        if interp_txt:
+                            st.write(interp_txt)
+                        if ct_res.get("heatmap_png"):
+                            st.markdown("**Carte de chaleur du crosstab**")
+                            st.image(ct_res["heatmap_png"])
+                        caption_lines = [ct_res.get("summary", "")]
+                        if not interp_txt:
+                            caption_lines.append("Interprétation non disponible pour ce couple de variables.")
+                        if ct_res.get("v") is not None:
+                            try:
+                                caption_lines.append(f"V de Cramer : {float(ct_res.get('v')):.2f}")
+                            except Exception:
+                                pass
+                        elif ct_res.get("assoc"):
+                            caption_lines.append(ct_res["assoc"])
+                        caption_lines.append(
+                            "Lecture : vert = surreprésentation, rouge = sous-représentation par rapport à l’indépendance (résidus standardisés, après discrétisation éventuelle des variables continues)."
+                        )
+                        st.caption("\n".join([c for c in caption_lines if c]))
 
-                # Crosstabs demandés
-                for pair in plan.get("crosstabs", []):
-                    if not isinstance(pair, (list, tuple)) or len(pair) < 2:
-                        continue
-                    var_a, var_b = str(pair[0]), str(pair[1])
-                    if var_a not in df_ready.columns or var_b not in df_ready.columns:
-                        st.warning(f"Crosstab ignoré (variables absentes) : {var_a}, {var_b}")
-                        continue
-                    interp_session = _get_crosstab_interpretation(var_a, var_b)
-                    ct_res = summarize_crosstab(
-                        df_ready,
-                        var_a,
-                        var_b,
-                        num_quantiles=st.session_state.get("num_quantiles", 5),
-                        mod_freq_min=st.session_state.get("mod_freq_min", 0.9),
-                        distinct_threshold_continuous=st.session_state.get("distinct_threshold_continuous", 5),
-                        top=5,
-                        crosstab_fn=crosstab_with_std_residuals,
-                        heatmap_fn=crosstab_heatmap_png,
-                        interpretation_fn=interpret_crosstab_with_llm if interp_session is None else None,
-                    )
-                    if interp_session:
-                        ct_res["interpretation"] = interp_session
-                    # Affichage
-                    interp_txt = ct_res.get("interpretation")
-                    if interp_txt:
-                        st.write(interp_txt)
-                    if ct_res.get("heatmap_png"):
-                        st.markdown("**Carte de chaleur du crosstab**")
-                        st.image(ct_res["heatmap_png"])
-                    caption_lines = [ct_res.get("summary", "")]
-                    if not interp_txt:
-                        caption_lines.append("Interprétation non disponible pour ce couple de variables.")
-                    if ct_res.get("assoc"):
-                        caption_lines.append(ct_res["assoc"])
-                    caption_lines.append(
-                        "Lecture : vert = surreprésentation, rouge = sous-représentation par rapport à l’indépendance (résidus standardisés, après discrétisation éventuelle des variables continues)."
-                    )
-                    st.caption("\n".join([c for c in caption_lines if c]))
+                    # Distributions demandées
+                    for var in plan.get("distributions", []):
+                        if var not in df_ready.columns:
+                            st.warning(f"Distribution ignorée (variable absente) : {var}")
+                            continue
+                        dist_info = _summarize_distribution(df_ready[var])
+                        summary_txt = dist_info.get("summary", "")
+                        insight_txt = dist_info.get("insight", "")
+                        dist_items = (
+                            st.session_state.get("figs_variables_distribution_detailed")
+                            or st.session_state.get("figs_variables_distribution")
+                            or []
+                        )
+                        shown = False
+                        for item in dist_items:
+                            title = str(item.get("title", "")).lower()
+                            if var.lower() in title:
+                                img_bytes = item.get("png")
+                                if isinstance(img_bytes, (bytes, bytearray, memoryview)):
+                                    st.subheader(f"Distribution de {var}")
+                                    st.image(img_bytes)
+                                    if insight_txt:
+                                        st.caption(f"Interprétation : {insight_txt}")
+                                    shown = True
+                                    break
+                        st.caption(f"{var} — {summary_txt}")
+                        if insight_txt and not shown:
+                            st.caption(f"Interprétation : {insight_txt}")
+                else:
+                    with st.spinner("Analyse de la question par LLM en cours..."):
+                        plan = _llm_plan(
+                            question,
+                            df_ready,
+                            dataset_context,
+                            crosstabs_interpretation,
+                            sankey_pair_results,
+                            sankey_latents,
+                        )
+                        if plan and plan.get("raw_answer"):
+                            st.text_area("Réponse :", plan.get("raw_answer", ""), height=220)
 
-                # Distributions demandées
-                for var in plan.get("distributions", []):
-                    if var not in df_ready.columns:
-                        st.warning(f"Distribution ignorée (variable absente) : {var}")
-                        continue
-                    dist_info = _summarize_distribution(df_ready[var])
-                    summary_txt = dist_info.get("summary", "")
-                    insight_txt = dist_info.get("insight", "")
-                    dist_items = (
-                        st.session_state.get("figs_variables_distribution_detailed")
-                        or st.session_state.get("figs_variables_distribution")
-                        or []
-                    )
-                    shown = False
-                    for item in dist_items:
-                        title = str(item.get("title", "")).lower()
-                        if var.lower() in title:
-                            img_bytes = item.get("png")
-                            if isinstance(img_bytes, (bytes, bytearray, memoryview)):
-                                st.subheader(f"Distribution de {var}")
-                                st.image(img_bytes)
-                                if insight_txt:
-                                    st.caption(f"Interprétation : {insight_txt}")
-                                shown = True
-                                break
-                    st.caption(f"{var} — {summary_txt}")
-                    if insight_txt and not shown:
-                        st.caption(f"Interprétation : {insight_txt}")
-                return
-            with st.spinner("Analyse de la question par LLM en cours..."):
-                plan = _llm_plan(question, df_ready, dataset_context, crosstabs_interpretation, sankey_pair_results, sankey_latents)
-                if plan and plan.get("raw_answer"):
-                    st.text_area("Réponse :", plan.get("raw_answer", ""), height=220)
+            except Exception as e:
+                st.error(f"Erreur d'appel à l'API OpenAI : {e}")
 
-        except Exception as e:
-            st.error(f"Erreur d'appel à l'API OpenAI : {e}")
+    st.markdown("#### Actions suivantes")
+    back_col, change_col, reset_col = st.columns(3)
+    with back_col:
+        if st.button("Retour au rapport", use_container_width=True):
+            _goto_step("3")
+    with change_col:
+        if st.button("Changer les objectifs", use_container_width=True):
+            st.session_state["__DG_FORCE_RERUN__"] = True
+            st.session_state["pipeline_ready_to_run"] = False
+            st.session_state["pipeline_executed"] = False
+            st.session_state["pipeline_status"] = None
+            st.session_state["pipeline_halt"] = None
+            st.session_state["final_report_ready"] = False
+            st.session_state["final_export_zip_bytes"] = None
+            st.session_state["etape2_terminee"] = False
+            st.session_state["etape40_terminee"] = False
+            st.session_state["etape41_terminee"] = False
+            _goto_step("2")
+    with reset_col:
+        if st.button("Réinitialiser", use_container_width=True):
+            reset_app_state()
+
+    st.session_state["etape41_terminee"] = True

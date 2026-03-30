@@ -40,34 +40,58 @@ def run():
         st.session_state["crosstabs_generated"] = False
         return
 
-    crosstabs = []
-    max_pairs = 6  # garde-fou perf
-    pair_count = 0
+    # 1) Couples issus du Sankey (triés par V de Cramer décroissant)
+    sankey_pairs = st.session_state.get("sankey_pair_results", {}) or {}
+    sankey_sorted = []
+    for _, item in sankey_pairs.items():
+        try:
+            vx, vy = str(item.get("var_x")), str(item.get("var_y"))
+            v_val = float(item.get("v") or 0)
+            if vx and vy:
+                sankey_sorted.append((v_val, vx, vy))
+        except Exception:
+            continue
+    sankey_sorted.sort(key=lambda t: t[0], reverse=True)
 
-    for var_x in targets:
-        for var_y in illustratives:
-            if var_x == var_y:
+    # 2) Paires directes cibles/illustratives (niveau 1) en complément
+    direct_pairs = []
+    for vx in targets:
+        for vy in illustratives:
+            if vx == vy:
                 continue
-            if pair_count >= max_pairs:
-                break
-            try:
-                ct_count, ct_pct_row, std_res = crosstab_with_std_residuals(df, var_x, var_y)
-                base_interpretation = interpret_crosstab_with_llm(var_x, var_y, ct_pct_row, std_res)
-                heatmap_png = crosstab_heatmap_png(
-                    ct_pct_row,
-                    std_res,
-                    title=f"{var_x} vs {var_y}",
-                )
-                crosstabs.append({
-                    "var_x": var_x,
-                    "var_y": var_y,
-                    "interpretation": base_interpretation,
-                    "heatmap_png": heatmap_png,
-                    "ct_pct_row": ct_pct_row.to_dict(),
-                })
-                pair_count += 1
-            except Exception:
-                continue
+            direct_pairs.append((None, vx, vy))
+
+    # 3) Fusion en préservant l'ordre (Sankey d'abord) et unicité
+    merged = []
+    seen = set()
+    for entry in sankey_sorted + direct_pairs:
+        _, vx, vy = entry
+        key = (vx, vy)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append((vx, vy))
+
+    max_pairs = 20  # garde-fou perf
+    crosstabs = []
+    for vx, vy in merged[:max_pairs]:
+        try:
+            ct_count, ct_pct_row, std_res = crosstab_with_std_residuals(df, vx, vy)
+            base_interpretation = interpret_crosstab_with_llm(vx, vy, ct_pct_row, std_res)
+            heatmap_png = crosstab_heatmap_png(
+                ct_pct_row,
+                std_res,
+                title=f"{vx} vs {vy}",
+            )
+            crosstabs.append({
+                "var_x": vx,
+                "var_y": vy,
+                "interpretation": base_interpretation,
+                "heatmap_png": heatmap_png,
+                "ct_pct_row": ct_pct_row.to_dict(),
+            })
+        except Exception:
+            continue
 
     st.session_state["crosstabs_interpretation"] = crosstabs
     st.session_state["crosstabs_generated"] = bool(crosstabs)

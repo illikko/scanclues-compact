@@ -16,7 +16,7 @@ require_invite_code()
 st.set_page_config(
     page_title="Application principale",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ----------------------- DF registry (phase 2) -----------------------
@@ -45,7 +45,7 @@ from apps.PipelineRunner import _trace_module_calls
 # ----------------------- Etapes -----------------------
 ETAPES = [
     {"numero": "1", "cle_session": "etape1_terminee", "module": Preparation1, "label": "Upload"},
-    {"numero": "2", "cle_session": "etape2_terminee", "module": DiagnosticGlobal, "label": "Diagnostic Global"},
+    {"numero": "2", "cle_session": "etape2_terminee", "module": DiagnosticGlobal, "label": "Définition des objectifs"},
     {"numero": "3", "cle_session": "etape40_terminee", "module": RapportFinal, "label": "Rapport Final"},
     {"numero": "4", "cle_session": "etape41_terminee", "module": QA, "label": "Q&A"},
 ]
@@ -126,15 +126,16 @@ st.session_state.pop(URL_GUARD_KEY, None)
 # ----------------------- Helpers UI -----------------------
 def _fmt(num: str) -> str:
     e = META[num]
-    dynamic_label = e["label"]
-    if num == "3":
-        if not st.session_state.get("pipeline_executed", False):
-            dynamic_label = "Work in progress..."
-        else:
-            dynamic_label = "Rapport Final"
-    chk = " [OK]" if st.session_state[e["cle_session"]] else ""
-    label = f'{num} - {dynamic_label}{chk}'
-    return label if len(label) <= 48 else label[:47] + "..."
+    # libellé compact pour l'onglet
+    short = {
+        "1": "Upload",
+        "2": "Objectifs",
+        "3": "Rapport",
+        "4": "Q&A",
+    }.get(num, e["label"])
+    done = bool(st.session_state.get(e["cle_session"], False))
+    suffix = " 🟢" if done else ""
+    return f"**{num} - {short}{suffix}**"
 
 def _goto(num: str):
     # Met à jour la sélection + URL, puis relance; le selectbox suit via 'index'
@@ -145,8 +146,7 @@ def _goto(num: str):
     except AttributeError:
         st.experimental_rerun()
 
-# ----------------------- UI NAV (selectbox sans key + Prev/Next) -----------------------
-st.sidebar.image("logo_scanClues.png", width=300)
+# ----------------------- UI NAV (tabs horizontaux Streamlit natif) -----------------------
 
 # 0) Récupère l'étape active depuis l'état/URL et sécurise
 active_num = str(st.session_state.get(NAV_SELECTED_KEY, OPTIONS[0]))
@@ -160,17 +160,19 @@ active_idx = OPTIONS.index(active_num)
 # Mode unique (suppression du toggle auto/manuel)
 st.session_state.setdefault(MODE_KEY, "automatique")
 
-# Navigation par etape (suppression des fleches)
-choice = st.sidebar.selectbox(
-    "Etape",
+# Navigation horizontale en haut de page
+nav_choice = st.radio(
+    "",
     options=OPTIONS,
     format_func=_fmt,
     index=active_idx,
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
 # Si l'utilisateur a choisi une autre etape, on y va et on coupe ce rendu
-if choice != active_num:
-    _goto(choice)
+if nav_choice != active_num:
+    _goto(nav_choice)
     st.stop()
 
 # ----------------------- Exécuter le module choisi + chainage auto -----------------------
@@ -189,7 +191,9 @@ was_done_before_run = bool(st.session_state.get(done_key, False))
 progress_slot = st.empty()
 
 def _render_progress(module_label: str, fn_name: str = ""):
-    progress_slot.info(f"Module en cours: {module_label}\nFonction en cours: {fn_name or '-'}")
+    progress_slot.info(
+        f"⚙️ Exécution pipeline en cours — Module : {module_label} — Fonction : {fn_name or '-'}"
+    )
 
 def _run_with_trace(mod, label: str):
     prev_trace = st.session_state.get("pipeline_trace_functions", False)

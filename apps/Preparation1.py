@@ -231,7 +231,7 @@ def run():
     # -------- 1) Upload --------
     # param
     
-    st.title("Binge analyse your datasets")
+    st.subheader("Upload")
     st.write("L'application scanClues permet de préparer et analyser vos jeux de données tabulaires. Une présentation est fournie ci-dessous.")
        
     with st.expander("A propos de l'application", expanded=False):

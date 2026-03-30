@@ -382,7 +382,6 @@ def run():
     if not st.session_state.filtered_coords.empty:
         st.dataframe(st.session_state.filtered_coords.style.format("{:.3f}"))
     else:
-        st.info("âœ… Aucune modalité ne dépasse le seuil sur les axes sélectionnés.")
         st.session_state["etape22_terminee"] = True
 
     # Invalidation de l'étape 4 si modifs après validation
@@ -502,6 +501,7 @@ def run():
 
     st.write("âœ… Vous pouvez lancer la prochaine étape dans le menu à gauche: Segmentation.")
     st.session_state["etape22_terminee"] = True
+
 
 
 

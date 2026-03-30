@@ -12,6 +12,7 @@ from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
 
 from core.df_registry import init_df_registry
+from core.reset_state import reset_app_state
 from .CadrageAnalyse import _call_llm
 from .PipelineRunner import run_selected
 from ._report import (
@@ -1258,8 +1259,8 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     # Fin de l'étape
     # =============================================================
 
-    st.subheader("Actions")
-    qa_col, reset_col = st.columns(2)
+    st.markdown("#### Actions suivantes")
+    qa_col, change_col, reset_col = st.columns(3)
     with qa_col:
         if st.button("Posez une question", use_container_width=True):
             try:
@@ -1268,39 +1269,27 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 st.experimental_set_query_params(step="4")
             st.session_state["__NAV_SELECTED__"] = "4"
             st.rerun()
-    with reset_col:
-        if st.button("Réinitialiser", use_container_width=True):
-            reset_report()
-            next_upload_nonce = int(st.session_state.get("__UPLOAD_NONCE__", 0)) + 1
-            keep_keys = {"__NAV_SELECTED__", "__URL_GUARD__", "__NAV_MODE__", "__NAV_TRIPWIRE__", "__AUTO_JUMP_GUARD__"}
-            for k in list(st.session_state.keys()):
-                lk = str(k).lower()
-                if k in keep_keys:
-                    continue
-                if "invite" in lk or "auth" in lk:
-                    continue
-                del st.session_state[k]
-
-            st.session_state["__UPLOAD_NONCE__"] = next_upload_nonce
-            st.session_state["etape1_terminee"] = False
+    with change_col:
+        if st.button("Changer les objectifs", use_container_width=True):
+            st.session_state["__DG_FORCE_RERUN__"] = True
+            st.session_state["pipeline_ready_to_run"] = False
+            st.session_state["pipeline_executed"] = False
+            st.session_state["pipeline_status"] = None
+            st.session_state["pipeline_halt"] = None
+            st.session_state["final_report_ready"] = False
+            st.session_state["final_export_zip_bytes"] = None
             st.session_state["etape2_terminee"] = False
             st.session_state["etape40_terminee"] = False
             st.session_state["etape41_terminee"] = False
-            st.session_state["pipeline_ready_to_run"] = False
-            st.session_state["pipeline_executed"] = False
-            st.session_state["final_report_ready"] = False
-            st.session_state["final_export_zip_bytes"] = None
-
-            # Réinitialise aussi le registry de DataFrames.
-            init_df_registry()
-
-            st.session_state["__NAV_SELECTED__"] = "1"
+            st.session_state["__NAV_SELECTED__"] = "2"
             try:
-                st.query_params["step"] = "1"
+                st.query_params["step"] = "2"
             except Exception:
-                st.experimental_set_query_params(step="1")
-            st.success("Application réinitialisée.")
+                st.experimental_set_query_params(step="2")
             st.rerun()
+    with reset_col:
+        if st.button("Réinitialiser", use_container_width=True):
+            reset_app_state()
 
     st.session_state["etape40_terminee"] = True
     st.stop()

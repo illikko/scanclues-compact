@@ -359,7 +359,7 @@ def render_pipeline_form() -> bool:
 
 
 def run():
-    st.title("Diagnostic Global")
+    st.subheader("Définition des objectifs")
 
     ensure_analysis_params(st.session_state)
     _init_session_state()
@@ -371,10 +371,26 @@ def run():
 
     st.success(f"Dataset chargé : {df.shape[0]} lignes x {df.shape[1]} colonnes")
 
-    diag = _run_diagnostics(df)
-    st.session_state["pipeline_diagnostics"] = diag
-    prep_tasks = _suggest_preparation_tasks(df, diag)
-    st.subheader("Traitements de préparation à réaliser")
+    current_upload_nonce = int(st.session_state.get("__UPLOAD_NONCE__", 0))
+    cached_diag = st.session_state.get("pipeline_diagnostics")
+    cached_tasks = st.session_state.get("pipeline_prep_tasks", [])
+    revisit_without_changes = (
+        isinstance(cached_diag, dict)
+        and st.session_state.get("__DG_LAST_NONCE__", current_upload_nonce) == current_upload_nonce
+        and not st.session_state.pop("__DG_FORCE_RERUN__", False)
+    )
+
+    if revisit_without_changes and cached_tasks:
+        diag = cached_diag
+        prep_tasks = cached_tasks
+    else:
+        diag = _run_diagnostics(df)
+        st.session_state["pipeline_diagnostics"] = diag
+        prep_tasks = _suggest_preparation_tasks(df, diag)
+        st.session_state["pipeline_prep_tasks"] = prep_tasks
+        st.session_state["__DG_LAST_NONCE__"] = current_upload_nonce
+
+    st.markdown("#### Traitements de préparation à réaliser")
     st.markdown("\n".join([f"- {t}" for t in prep_tasks]))
     if st.session_state.get("verbatim_only_dataset"):
         st.info("Dataset 100% verbatim détecté : seule la synthèse des verbatims sera exécutée.")
