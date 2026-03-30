@@ -584,31 +584,44 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             with st.spinner("Rédaction de la synthèse générale par LLM en cours..."):
                 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-                if dataset_key_questions_mode == "ab" and str(dataset_key_questions or "").strip():
-                    global_synthesis_prompt = "\n".join([
-                        "Vous etes un expert en analyse de donnees. Repondez en francais, clair et concis.",
-                        "Suivez strictement ces etapes :",
-                        "1) Verifiez si les artefacts fournis (profils_y, segmentation, ACM, dendrogramme, sankey/crosstabs, contexte) suffisent pour repondre.",
-                        "2) Reperez dans dataset_key_questions et dans 'columns' les variables du dataset (limitez-vous aux noms fournis) et leur role (target_variables, illustrative_variables).",
-                        "3) Choisissez les modules pertinents (profils_y, tris croises, distributions, analyse descriptive) pour repondre a la question.",
-                        "4) Si un module permet de repondre, synthesez les resultats sans inventer de nouvelles variables ou scores.",
-                        "5) Si les donnees sont insuffisantes, dites-le explicitement et proposez uniquement ce qui est supporte par les artefacts.",
-                        "6) Format: bullet points d'abord, puis limites et pistes d'approfondissement.",
-                        "Brief utilisateur : dataset_key_questions (prioritaire si present).",
-                        "Terminez par: 'Tous les details complementaires sont disponibles dans l'analyse complete.'",
-                    ])
-                else:
-                    global_synthesis_prompt = "\n".join([
-                        "Vous etes un expert en analyse de donnees. Repondez en francais, clair et concis.",
-                        "Suivez strictement ces etapes :",
-                        "1) Verifiez si les artefacts fournis (profils_y, segmentation, ACM, dendrogramme, sankey/crosstabs, contexte) suffisent pour repondre.",
-                        "2) Reperez dans 'columns' les variables du dataset et leur role (target_variables, illustrative_variables).",
-                        "3) Choisissez les modules pertinents (profils_y, tris croises, distributions, analyse descriptive) pour repondre.",
-                        "4) Si un module permet de repondre, synthesez les resultats sans inventer de nouvelles variables ou scores.",
-                        "5) Si les donnees sont insuffisantes, dites-le explicitement et proposez uniquement ce qui est supporte par les artefacts.",
-                        "6) Format: bullet points d'abord, puis limites et pistes d'approfondissement.",
-                        "Terminez par: 'Tous les details complementaires sont disponibles dans l'analyse complete.'",
-                    ])
+                global_synthesis_prompt = "\n".join(['''
+                Vous êtes un expert en analyse de donnees. Repondez en français, clair et concis.
+                Un jeu de données tabulaire (typiquement un export CSV/excel) a été fourrni dans le but d'en extraire des insights, recommandations, sur les variables cibles, souvent des KPIs métiers.
+                Les informations à extraire ont été identifiées, et des analyses pour comprendre le contexte du jeu de données ont déjà été réalisées et vous sont fournies plus bas:
+                - dataset_subject: pour définir le sujet sur lequel porte le jeu de données
+                - dataset_context: une description du jeu de données et de ses variables
+                - dataset_recommendations: des recommandations techniques pour l'analyse d'une nouvelle version de ce jeu de données.
+                - la cible est définie par la variable cible ({target_variables}) et sa modalité cible (target_modality), et sont données ici : {tm}
+                
+                Des analyses statistiques ont déjà été réalisées:
+                - sankey_diagram: le diagramme partant des variables illustratives (sociodémographiques si les unités d'obervations sont des personnes) vers les variables cibles
+                - target_profiles_text: la description des profils associées aux cibles identifiées.
+                - profil_dominant_analysis: les attributs dominants (médiane pour les variables continues, mode pour les variables catégorielles) 
+                - interpretationACM: une analyse factorielle (ACM) qui permet de définir dimensions sémantiques (les axes de l'ACP) sur lesquelles des groupes d'attributs s'opposent
+                - segmentation_profiles_text: la description des profils isssus d'une segmentation
+                - dendrogramm_interpretation: l'interprétation du dendrogramme des corrélations entre les variables
+                - ctas_rules_text: les règles d'obtention de la cible à partir des variables illustratives (sociodémographiques)
+                
+                Rédigez les principaux insights du jeu de données: 
+                - à partir des analyses statistiques réalisées
+                - sous formes de bullet points
+                avec les sections suivantes:
+                - avec la description du profil dominant (détaillé dans profil_dominant_analysis)
+                - des profils associés à la cible (détaillé dans profils_y_text), que vous mentionnez dans le titre de cette section : {tm}. Ne mentionnez que les fréquences de la population globale, pas les fréquences cible.
+                - les profils issus de la segmentation de la population globale (détaillé dans segmentation_profiles_text)
+                - des attributs permettant d'obtenir la cible (détaillé dans ctas_rules_text)
+                - s'il manque des variables clé pour expliquer la variable cible.
+                Commencer les énumérations par ce qui est le plus important et en rapport avec le dataset_subject.
+                Distinguez ce qui est attendus de ce qui est plus surprenant ou contre-intuitif.
+                Répondez aux objectifs recherchés si ils ont été précisés dans dataset_key questions.
+                
+                Dans un paragraphe à part, proposez de refaire l'analyse avec un nouvel angle, en :
+                -- prenant les autres cibles (autres modalités ou autres variables que la variable et sa modalité utilisée pour cette analyse), parmi celles déjà identifiées (target_variables) 
+                -- augmentant la granularité de l'analyse (augmenter le nombre des segments, la discrétisation des variables...)
+                -- ajouter les variables qui manquent actuellement dans le jeu de données mais qui seraient pertinentes pour répondre aux questions posées (dataset_key_questions) et qui sont identifiées dans dataset_recommendations.
+                
+                Finissez enfin par indiquer que tous les détails de l'analyse sont fournis dans les sections suivantes.
+                '''])
 
                 preview = df_ready.head(10).to_csv(index=False)
                 preview = preview[:20000]  # limiter la taille
@@ -672,7 +685,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             proceed = True
     if show_technical_text and proceed and not st.session_state.get("final_report_ready", False) and isinstance(df_ready, pd.DataFrame) and not df_ready.empty:
         try:
-            with st.spinner("Rédacction de la synthèse sur la préparation du jeu de données par LLM en cours..."):
+            with st.spinner("Rédaction de la synthèse sur la préparation du jeu de données par LLM en cours..."):
                 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
                 data_preparation = f'''Vous êtes un expert en analyse de données. Réponds en français, clair et concis.
