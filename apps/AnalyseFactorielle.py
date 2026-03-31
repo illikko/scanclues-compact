@@ -378,7 +378,7 @@ def run():
 
     # Recalcul du filtrage en live (et mémos coords/cos2)
     recompute_filtered_coords()
-    st.markdown("##### Coordonnées factorielles des modalités (cos² â‰¥ seuil sur au moins un axe)")
+    st.markdown("##### Coordonnées factorielles des modalités (cos² à seuil sur au moins un axe)")
     if not st.session_state.filtered_coords.empty:
         st.dataframe(st.session_state.filtered_coords.style.format("{:.3f}"))
     else:
@@ -425,7 +425,7 @@ def run():
         for e in errors[:80]:
             st.write("• ", e)
     else:
-        st.success("âœ“ Toutes les modalités listées respectent cos² ET |coord| pour leur axe.")
+        st.success("Toutes les modalités listées respectent cos² ET |coord| pour leur axe.")
 
     # Payload compact pour le LLM
     axis_groups_topk = truncate_groups_topk_by_abscoord(axis_groups, coords, k=topk)
@@ -465,7 +465,7 @@ def run():
                         Il y a plusieurs Groupes (correspondant à chaque axe factoriel), chacun avec deux Sous-groupes opposés (A positif / B négatif, ayant des coordonnées opposées sur les axes factoriels).
                         et pour chaque sous-groupe une liste variable/modalité').
                         TA MISSION :
-                        - Fournir une SYNTHÃˆSE (5-10 phrases) qui explique la relation entre tous les modalités des différents axes, et la relation logique qu'elles peuvent avoir.                   
+                        - Fournir une SYNTHESE (5-10 phrases) qui explique la relation entre tous les modalités des différents axes, et la relation logique qu'elles peuvent avoir.                   
                         - Pour le faire, attribue un NOM SPÉCIFIQUE et OPÉRATIONNEL à chaque Groupe (évite les intitulés génériques).
                         - Et pour chaque Sous-groupe, attribue un SOUS-NOM court et explicite, qui exprime la nature de l'opposition entre les 2 sous-groupes.
                         - utilise tous les groupes qui sont proposés, ne pas en oublier.

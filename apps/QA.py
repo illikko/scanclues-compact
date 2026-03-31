@@ -438,7 +438,7 @@ def run():
             except Exception as e:
                 st.error(f"Erreur d'appel à l'API OpenAI : {e}")
 
-    st.markdown("#### Actions suivantes")
+    st.markdown("##### Actions suivantes")
     back_col, change_col, reset_col = st.columns(3)
     with back_col:
         if st.button("Retour au rapport", use_container_width=True):

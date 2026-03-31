@@ -42,12 +42,16 @@ def _init_session_state() -> None:
         "etape2_terminee": False,
         "pipeline_selection": {
             "preparation": True,
-            "profilage": False,
-            "analyse_descriptive": False,
+            "profilage": True,
+            "analyse_descriptive": True,
+            "sankey_crosstabs": False,
+            "distribution_figures": False,
         },
         "pipeline_ready_to_run": False,
         "pipeline_diagnostics": {},
         "dataset_key_questions_value": "",
+        "dataset_key_questions_value_saved": "",
+        "dataset_key_questions": "",
         "dataset_key_questions_mode": "sb",
         "dataset_key_questions_saved": False,
         "pipeline_executed": False,
@@ -193,60 +197,55 @@ def get_pipeline_config() -> dict:
 
 
 def render_pipeline_form() -> bool:
-    """Affiche le formulaire. Les widgets écrivent directement dans session_state."""
+    """Affiche le formulaire."""
     st.subheader("Choix des traitements à réaliser")
+
+    current_selection = st.session_state.get(
+        "pipeline_selection",
+        {
+            "preparation": True,
+            "profilage": True,
+            "analyse_descriptive": True,
+            "sankey_crosstabs": False,
+            "distribution_figures": False,
+        },
+    )
 
     with st.container(border=True):
         with st.form("pipeline_form", clear_on_submit=False):
             col1, col2, col3 = st.columns(3)
 
-            current_selection = st.session_state.get(
-                "pipeline_selection",
-                {
-                    "preparation": True,
-                    "profilage": False,
-                    "analyse_descriptive": False,
-                    "sankey_crosstabs": False,
-                    "distribution_figures": False,
-                },
-            )
-
             with col1:
-                st.checkbox(
+                preparation = st.checkbox(
                     "Préparation",
                     value=bool(current_selection.get("preparation", True)),
                     help="Inclut : toutes les étapes de préparation identifiées (valeurs manquantes et aberrantes, variables non informatives, codification des variables ordinales, libellées trop longs, colonnes à multi-modalités, manquantes structurantes, etc.)",
-                    key="ui_preparation",
                 )
 
             with col2:
-                st.checkbox(
+                profilage = st.checkbox(
                     "Profilage",
-                    value=bool(current_selection.get("profilage", False)),
+                    value=bool(current_selection.get("profilage", True)),
                     help="Inclut : Profils des segments sur la population globale, profils des segments cibles, etc.",
-                    key="ui_profilage",
                 )
 
             with col3:
-                st.checkbox(
+                analyse_descriptive = st.checkbox(
                     "Analyse descriptive",
-                    value=bool(current_selection.get("analyse_descriptive", False)),
+                    value=bool(current_selection.get("analyse_descriptive", True)),
                     help="Inclut : relations statistiques et sémantique entre les variables, représentation graphique synthétique de ces relations (diagramme de Sankey et dendrogramme).",
-                    key="ui_analyse_descriptive",
                 )
 
-            st.checkbox(
+            sankey_crosstabs = st.checkbox(
                 "Analyse détaillée des tris croisés",
                 value=bool(current_selection.get("sankey_crosstabs", False)),
                 help="Inclut : tris croisés détaillés pour les couples les pertinents de variables.",
-                key="run_sankey_crosstabs",
             )
 
-            st.checkbox(
+            distribution_figures = st.checkbox(
                 "Analyse détaillée de la distribution des variables",
                 value=bool(current_selection.get("distribution_figures", False)),
-                help="Inclut : les histogrammes de toutes les variables.",                
-                key="generate_distribution_figures",
+                help="Inclut : les histogrammes de toutes les variables.",
             )
 
             st.subheader("Brief (optionnel)")
@@ -257,10 +256,10 @@ def render_pipeline_form() -> bool:
                 horizontal=True,
                 key="dataset_key_questions_mode",
             )
-            st.text_area(
+
+            brief_value = st.text_area(
                 "Saisir le brief d'analyse",
                 key="dataset_key_questions_value",
-                value=st.session_state.get("dataset_key_questions_value", ""),
                 placeholder="Ex : identifier les profils les plus liés à la satisfaction élevée et proposer 3 actions prioritaires.",
                 height=120,
                 help='Le brief n\'est pris en compte que si "Avec brief" est sélectionné.',
@@ -349,14 +348,20 @@ def render_pipeline_form() -> bool:
 
             submitted = st.form_submit_button("Lancer", type="primary")
 
-    st.session_state["pipeline_selection"] = {
-        "preparation": bool(st.session_state.get("ui_preparation", False)),
-        "profilage": bool(st.session_state.get("ui_profilage", False)),
-        "analyse_descriptive": bool(st.session_state.get("ui_analyse_descriptive", False)),
-    }
+    if submitted:
+        st.session_state["pipeline_selection"] = {
+            "preparation": bool(preparation),
+            "profilage": bool(profilage),
+            "analyse_descriptive": bool(analyse_descriptive),
+            "sankey_crosstabs": bool(sankey_crosstabs),
+            "distribution_figures": bool(distribution_figures),
+        }
+        # Sauvegarde explicite du brief pour les écrans suivants (clé distincte pour éviter les conflits widgets)
+        st.session_state["dataset_key_questions_value_saved"] = st.session_state.get("dataset_key_questions_value", "")
+        # Copie non liée à un widget pour les modules en aval (RapportFinal / QA)
+        st.session_state["dataset_key_questions"] = st.session_state.get("dataset_key_questions_value", "")
 
     return submitted
-
 
 def run():
     st.subheader("Définition des objectifs")
@@ -390,7 +395,7 @@ def run():
         st.session_state["pipeline_prep_tasks"] = prep_tasks
         st.session_state["__DG_LAST_NONCE__"] = current_upload_nonce
 
-    st.markdown("#### Traitements de préparation à réaliser")
+    st.markdown("##### Traitements de préparation à réaliser")
     st.markdown("\n".join([f"- {t}" for t in prep_tasks]))
     if st.session_state.get("verbatim_only_dataset"):
         st.info("Dataset 100% verbatim détecté : seule la synthèse des verbatims sera exécutée.")

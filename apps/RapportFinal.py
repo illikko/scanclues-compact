@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import matplotlib as mpl
 from openai import OpenAI
@@ -51,7 +51,7 @@ def _rf_add_text(title: str, text: str):
     if not text:
         return
     title = _html.escape(title or "")
-    # on échappe le contenu puis on le met dans <pre> pour garder les puces/lignes
+    # on éhappe le contenu puis on le met dans <pre> pour garder les puces/lignes
     body = _html.escape(str(text))
     block = f"""
 <section style="margin:24px 0">
@@ -291,7 +291,8 @@ mpl.rcParams.update({
 # Application principale
 # ================================================================
 def run():
-    # Réinitialiser les blocs/flags de section détaillée à chaque exécution
+    st.subheader("Rapport")
+    # Réinitialiser les blocs/flags de section détaillée à chaque exécution
     st.session_state["_rf_blocks"] = []
     st.session_state["__DETAIL_SECTION_ADDED__"] = False
     mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
@@ -305,7 +306,7 @@ def run():
         "pipeline_selection",
         {"preparation": True, "profilage": False, "analyse_descriptive": False},
     )
-    # Forcer la régénération du rapport si dataset 100% verbatim
+    # Forcer la réparation du rapport si dataset 100% verbatim
     if st.session_state.get("verbatim_only_dataset"):
         st.session_state["final_report_ready"] = False
 
@@ -313,6 +314,9 @@ def run():
         'dataset_object': None,                      
         'dataset_context': None,               
         'dataset_key_questions': None,              
+        'dataset_key_questions_value': "",         
+        'dataset_key_questions_value_saved': "",
+        'dataset_key_questions_mode': "sb",
         'global_synthesis': None, 
         'global_synthesis_generated': False,
         'data_preparation_synthesis_generated': False,        
@@ -333,6 +337,7 @@ def run():
         'ordinal_codification_mapping': None,
         'shortened_labels_mapping': None,
         'syntheses_verbatim': None,
+        'brief_context_global_synthesis': None,
         'etape40_terminee': False,
     }
     for k, v in defaults.items():
@@ -343,7 +348,11 @@ def run():
     dataset_object = st.session_state.get('dataset_object')
     dataset_context = st.session_state.get('dataset_context')
     dataset_recommendations = st.session_state.get('dataset_recommendations')
-    dataset_key_questions = st.session_state.get('dataset_key_questions_value')
+    dataset_key_questions = (
+        st.session_state.get('dataset_key_questions_value')
+        or st.session_state.get("dataset_key_questions_value_saved")
+        or st.session_state.get("dataset_key_questions")
+    )
     dataset_key_questions_mode = st.session_state.get("dataset_key_questions_mode", "sb")
     profils_y_text = st.session_state.get('profils_y_text')
     profil_dominant_analysis = st.session_state.get('profil_dominant_analysis')
@@ -429,13 +438,6 @@ def run():
             logs = st.session_state.get("pipeline_execution_logs", [])
             skipped = [x for x in logs if x.get("status") == "skipped"]
             skipped_names = {x.get("module") for x in skipped}
-            if skipped_names and skipped_names.issubset({"DiagramSankey"}):
-                st.info(
-                    "Exécution pipeline terminée. "
-                    "DiagramSankey non exécuté (variables cibles/illustratives non disponibles)."
-                )
-            else:
-                st.warning("Execution pipeline terminee avec modules ignores (voir logs).")
         else:
             halt = st.session_state.get("pipeline_halt") or {}
             st.error(
@@ -456,23 +458,10 @@ def run():
             st.session_state["__PIPELINE_LABEL_REFRESHED__"] = True
             st.rerun()
 
-    logs = st.session_state.get("pipeline_execution_logs", [])
-    if logs:
-        with st.expander("Logs d'exécution des modules", expanded=False):
-            st.write("Variables cibles:", st.session_state.get("target_variables", []))
-            st.write("Variables illustratives:", st.session_state.get("illustrative_variables", []))
-            logs_df = pd.DataFrame(logs)
-            if not logs_df.empty:
-                keep_cols = [c for c in ["module", "status", "elapsed_sec"] if c in logs_df.columns]
-                st.dataframe(logs_df[keep_cols] if keep_cols else logs_df, use_container_width=True)
-            elapsed = st.session_state.get("pipeline_execution_seconds")
-            if isinstance(elapsed, (int, float)):
-                st.write("Temps execution pipeline (s):", round(float(elapsed), 2))
-
     verb_cols = st.session_state.get("verbatim_candidates", [])
     verb_ids = st.session_state.get("verbatim_identifier_cols", [])
 
-    # Affichage de la synthèse verbatim uniquement si des colonnes verbatim sont détectées
+    # Affichage de la synthàse verbatim uniquement si des colonnes verbatim sont détectées.
     if verb_cols or st.session_state.get("verbatim_only_dataset"):
         with st.expander("Synthèse des verbatims", expanded=False):
             if syntheses_verbatim:
@@ -485,8 +474,8 @@ def run():
             if verb_cols:
                 st.write(", ".join(map(str, verb_cols)))
 
-    # Contexte LLM minimal si absent.
-    if isinstance(df_ready, pd.DataFrame) and (
+    # Contexte LLM minimal si absent (une seule fois)
+    if isinstance(df_ready, pd.DataFrame) and not st.session_state.get("__RF_CONTEXT_DONE__", False) and (
         not st.session_state.get("dataset_context") or not st.session_state.get("dataset_object")
     ):
         try:
@@ -497,6 +486,7 @@ def run():
             st.session_state["target_variables"] = res.get("target_variables", [])
             st.session_state["target_modalities"] = res.get("target_modalities", {})
             st.session_state["illustrative_variables"] = res.get("illustrative_variables", [])
+            st.session_state["__RF_CONTEXT_DONE__"] = True
         except Exception:
             pass
 
@@ -508,7 +498,7 @@ def run():
     profilage_selected = bool(selection.get("profilage", False))
     descriptive_selected = bool(selection.get("analyse_descriptive", False))
     # Harmoniser avec les clés des checkboxes de DiagnosticGlobal et forcer l'affichage
-    # si des artefacts existent déjà en session (évite de masquer les résultats produits).
+    # si des artefacts existent déjà  en session (évite de masquer les résultats produits).
     sankey_crosstabs_selected = bool(
         st.session_state.get("run_sankey_crosstabs", selection.get("sankey_crosstabs", False))
         or st.session_state.get("sankey_pair_results")
@@ -535,42 +525,42 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     T100 = "Rapport d'analyse du jeu de donnees"
     T0 = "Principaux insights et recommandations"
     T10 = "Sommaire"
-    T11 = "1.1 Sujet du jeu de donnees"
+    T11 = "1.1 Sujet du jeu de données"
     T13 = "1.3 La route vers l'objectif"
     T131 = "Relations entre variables (Diagramme Sankey)"
     T134 = "Croisement entre les variables : "
     T135 = "Pourcentage en ligne"
-    T136 = "Interpretation du tableau des tris croises"
-    T15 = "1.5 Synthese des verbatims"
-    T21 = "2.1 Profils associes aux cibles"
-    T211 = "Profils detailles associes a la cible"
-    T212 = "Attributs presentes par ordre de differenciation croissant"
-    T22 = "2.2 Profils de la population entiere"
-    T221 = "Profils detailles de la segmentation"
-    T222 = "Attributs presentes par ordre de differenciation decroissant"
+    T136 = "Interprétation du tableau des tris croisés"
+    T15 = "1.5 Synthèse des verbatims"
+    T21 = "2.1 Profils associés aux cibles"
+    T211 = "Profils détaillés associés à la cible"
+    T212 = "Attributs présentés par ordre de différenciation croissant"
+    T22 = "2.2 Profils de la population entière"
+    T221 = "Profils détaillés de la segmentation"
+    T222 = "Attributs présentés par ordre de differenciation decroissant"
     T31 = "3.1 Relation entre les variables"
-    T32 = "3.2 Relations hierarchiques entre variables"
-    T33 = "3.3 Representation graphique des correlations entre variables"
-    T331 = "Dendrogramme des relations hierarchiques entre variables"
+    T32 = "3.2 Relations hiérarchiques entre variables"
+    T33 = "3.3 Représentation graphique des corrélations entre variables"
+    T331 = "Dendrogramme des relations hiérarchiques entre variables"
     T34 = "3.4 Regroupement des variables en dimensions latentes"
     T35 = "3.5 Analyse descriptive des variables"
     T352 = "3.5.2 Profil dominant"
     T351 = "3.5.1 Distribution des variables"
     T3521 = "Histogramme de la variable"
-    T41 = "4.1 Synthese sur la structure du jeu de donnees et de sa preparation"
-    T42 = "4.2 Contexte du jeu de donnees et role des variables"
-    T43 = "4.3 Caracteristiques du jeu de donnees"
-    T44 = "4.4 Caracteristiques des variables"
+    T41 = "4.1 Synthèse sur la structure du jeu de donnees et de sa preparation"
+    T42 = "4.2 Contexte du jeu de données et rôle des variables"
+    T43 = "4.3 Caractéristiques du jeu de données"
+    T44 = "4.4 Caractéristiques des variables"
     T45 = "4.5 Valeurs manquantes"
     T451 = "4.5.1 Pourcentage de valeurs manquantes par variable"
     T4611 = "Pourcentage de valeurs manquantes"
-    T452 = "4.5.2 Correlation entre variables avec des valeurs manquantes"
-    T4521 = "Carte de chaleur des correlations entre variables avec des valeurs manquantes"
-    T453 = "4.5.3 Correlation entre variables avec des valeurs manquantes"
-    T4531 = "Dendrogramme des correlations entre variables avec des valeurs manquantes"
-    T454 = "4.5.4 Resultat du test de Little"
-    T461 = "Etapes des preparations"
-    T462 = "Tableau de correspondance des libelles originaux/raccourcis"
+    T452 = "4.5.2 Corrélation entre variables avec des valeurs manquantes"
+    T4521 = "Carte de chaleur des corrélations entre variables avec des valeurs manquantes"
+    T453 = "4.5.3 Corrélation entre variables avec des valeurs manquantes"
+    T4531 = "Dendrogramme des corrélations entre variables avec des valeurs manquantes"
+    T454 = "4.5.4 Résultat du test de Little"
+    T461 = "Etapes des préparations"
+    T462 = "Tableau de correspondance des libellés originaux/raccourcis"
     T463 = "Tableau de correspondance d'encodage des variables ordinales"
 
     proceed = False
@@ -585,45 +575,77 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             with st.spinner("Rédaction de la synthèse générale par LLM en cours..."):
                 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-                global_synthesis_prompt = "\n".join(['''
-                Vous êtes un expert en analyse de donnees. Repondez en français, clair et concis.
-                Un jeu de données tabulaire (typiquement un export CSV/excel) a été fourrni dans le but d'en extraire des insights, recommandations, sur les variables cibles, souvent des KPIs métiers.
-                Les informations à extraire ont été identifiées, et des analyses pour comprendre le contexte du jeu de données ont déjà été réalisées et vous sont fournies plus bas:
-                - dataset_subject: pour définir le sujet sur lequel porte le jeu de données
-                - dataset_context: une description du jeu de données et de ses variables
-                - dataset_recommendations: des recommandations techniques pour l'analyse d'une nouvelle version de ce jeu de données.
-                - la cible est définie par la variable cible ({target_variables}) et sa modalité cible (target_modality), et sont données ici : {tm}
+                brief_context = None
+                brief_question = str(dataset_key_questions or "").strip()
+                if brief_question:
+                    brief_context = {
+                        "brief_question": brief_question[:1200],
+                        "brief_target_variable": st.session_state.get("brief_target_variable"),
+                        "brief_illustrative_variables": st.session_state.get("brief_illustrative_variables"),
+                        "brief_reason": st.session_state.get("brief_reason"),
+                        "brief_relevance": st.session_state.get("brief_relevance"),
+                    }
+                    st.session_state["brief_context_global_synthesis"] = brief_context
+                else:
+                    st.session_state["brief_context_global_synthesis"] = None
+
+                # Bloc prompt principal avec prise en compte optionnelle du brief (texte en clair, sans doublon)
+                brief_focus_instructions = ""
+                if brief_context:
+                    bq_clean = brief_question.replace("\n", " ").strip()
+                    brief_focus_instructions = f"""
+                PRISE EN COMPTE DU BRIEF (mode A/B) :
+                - Question du brief (rappel) : {bq_clean}
+                - OBLIGATOIRE : commencer la section "Principaux insights" par : "Question du brief : {bq_clean}".
+                - Ajouter 2 à 3 bullet points qui répondent directement à cette question, ancrés dans les données et en citant la cible du brief si elle est détectée.
+                - Si les données ne permettent pas de répondre complètement, écrire explicitement "Données insuffisantes pour répondre complètement au brief" dans ce bloc et dans les risques/limites.
+                    """
+
+                prompt_parts = []
+
+                if brief_focus_instructions:
+                    prompt_parts.append(brief_focus_instructions)
+
+                prompt_parts.append('''
+                Vous êtes un expert en analyse de données. Répondez en français, clair et concis.
+                Un jeu de données tabulaire (typiquement un export CSV/Excel) a été fourni dans le but d'en extraire des insights et recommandations sur les variables cibles, souvent des KPIs métier.
+                Les informations à extraire ont été identifiées, et des analyses pour comprendre le contexte du jeu de données ont déjà été réalisées et vous sont fournies plus bas :
+                - dataset_subject : le sujet du jeu de données
+                - dataset_context : description du jeu de données et de ses variables
+                - dataset_recommendations : recommandations techniques pour l'analyse d'une nouvelle version
+                - la cible est définie par la variable cible ({target_variables}) et sa modalité cible (target_modality) donnée ici : {tm}
                 
-                Des analyses statistiques ont déjà été réalisées:
-                - sankey_diagram: le diagramme partant des variables illustratives (sociodémographiques si les unités d'obervations sont des personnes) vers les variables cibles
-                - target_profiles_text: la description des profils associées aux cibles identifiées.
-                - profil_dominant_analysis: les attributs dominants (médiane pour les variables continues, mode pour les variables catégorielles) 
-                - interpretationACM: une analyse factorielle (ACM) qui permet de définir dimensions sémantiques (les axes de l'ACP) sur lesquelles des groupes d'attributs s'opposent
-                - segmentation_profiles_text: la description des profils isssus d'une segmentation
-                - dendrogramm_interpretation: l'interprétation du dendrogramme des corrélations entre les variables
-                - ctas_rules_text: les règles d'obtention de la cible à partir des variables illustratives (sociodémographiques)
+                Des analyses statistiques ont déjà été réalisées :
+                - sankey_diagram : relations des variables illustratives vers les variables cibles
+                - target_profiles_text : profils associés aux cibles identifiées
+                - profil_dominant_analysis : attributs dominants (médiane pour les continues, mode pour les catégorielles)
+                - interpretationACM : dimensions sémantiques issues de l'ACM
+                - segmentation_profiles_text : profils issus d'une segmentation
+                - dendrogramm_interpretation : interprétation du dendrogramme des corrélations
                 
-                Rédigez les principaux insights du jeu de données: 
+                Rédigez les principaux insights du jeu de données :
                 - à partir des analyses statistiques réalisées
-                - sous formes de bullet points
-                avec les sections suivantes:
-                - avec la description du profil dominant (détaillé dans profil_dominant_analysis)
-                - des profils associés à la cible (détaillé dans profils_y_text), que vous mentionnez dans le titre de cette section : {tm}. Ne mentionnez que les fréquences de la population globale, pas les fréquences cible.
-                - les profils issus de la segmentation de la population globale (détaillé dans segmentation_profiles_text)
-                - des attributs permettant d'obtenir la cible (détaillé dans ctas_rules_text)
-                - s'il manque des variables clé pour expliquer la variable cible.
-                Commencer les énumérations par ce qui est le plus important et en rapport avec le dataset_subject.
-                Distinguez ce qui est attendus de ce qui est plus surprenant ou contre-intuitif.
-                Répondez aux objectifs recherchés si ils ont été précisés dans dataset_key questions.
-                
+                - sous forme de bullet points
+                Sections attendues :
+                - profil dominant (profil_dominant_analysis)
+                - profils associés à la cible (profils_y_text) avec le titre contenant {tm} ; ne mentionner que les fréquences de la population globale.
+                - profils issus de la segmentation (segmentation_profiles_text)
+                - variables clés manquantes pour expliquer la cible.
+                Commencer par ce qui est le plus important et lié à dataset_subject.
+                Distinguer ce qui est attendu de ce qui est surprenant ou contre-intuitif.
+                Répondre aux objectifs recherchés s'ils ont été précisés dans dataset_key_questions.
+                ''')
+
+                prompt_parts.append('''
                 Dans un paragraphe à part, proposez de refaire l'analyse avec un nouvel angle, en :
-                -- prenant les autres cibles (autres modalités ou autres variables que la variable et sa modalité utilisée pour cette analyse), parmi celles déjà identifiées (target_variables) 
-                -- augmentant la granularité de l'analyse (augmenter le nombre des segments, la discrétisation des variables...)
-                -- ajouter les variables qui manquent actuellement dans le jeu de données mais qui seraient pertinentes pour répondre aux questions posées (dataset_key_questions) et qui sont identifiées dans dataset_recommendations.
+                -- prenant les autres cibles (autres modalités ou autres variables que la variable et sa modalité utilisée pour cette analyse), parmi celles déjà identifiées (target_variables)
+                -- augmentant la granularité de l'analyse (plus de segments, discrétisation des variables...)
+                -- ajoutant les variables manquantes qui seraient pertinentes pour répondre aux questions posées (dataset_key_questions) et qui sont identifiées dans dataset_recommendations.
                 
                 Finissez enfin par indiquer que tous les détails de l'analyse sont fournis dans les sections suivantes.
-                '''])
+                ''')
 
+                global_synthesis_prompt = "\n".join(prompt_parts)
                 preview = df_ready.head(10).to_csv(index=False)
                 preview = preview[:20000]  # limiter la taille
 
@@ -658,8 +680,10 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                     "profils_y_text": profils_y_text,
                     "segmentation_profiles_text": segmentation_profiles_text,
                 }
-                if dataset_key_questions_mode == "ab" and str(dataset_key_questions or "").strip():
+                if str(dataset_key_questions or "").strip():
                     context_blob_global_synthesis["dataset_key_questions"] = dataset_key_questions
+                if brief_context and dataset_key_questions_mode == "ab":
+                    context_blob_global_synthesis["brief_context"] = brief_context
 
                 user_content = json.dumps(context_blob_global_synthesis, ensure_ascii=False, default=str)
 
@@ -673,12 +697,23 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 )
 
                 global_synthesis = r1.choices[0].message.content
+                # Si brief en mode A/B, préfixer la synthèse par un bloc déterministe conforme aux consignes
+                if brief_context and dataset_key_questions_mode == "ab":
+                    bq_clean = brief_question.replace("\n", " ").strip()
+                    prefix = (
+                        f"Question du brief : {bq_clean}\n"
+                        "- Les points suivants répondent directement à cette question en s'appuyant sur les analyses réalisées "
+                        "tout en couvrant l'ensemble des insights standards.\n\n"
+                    )
+                    global_synthesis = prefix + (global_synthesis or "")
+
                 st.session_state.global_synthesis = global_synthesis
                 st.session_state.global_synthesis_generated = True
 
         except Exception as e:
-            st.error(f"Une erreur est survenue lors de l'appel a l'API : {e}")
+            st.error(f"Une erreur est survenue lors de l'appel à l'API : {e}")
 
+                
     if mode == "automatique":
         proceed = True
     else:
@@ -691,7 +726,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
 
                 data_preparation = f'''Vous êtes un expert en analyse de données. Réponds en français, clair et concis.
                 Un jeu de données a été préparé dans le but de réaliser une analyse.
-                Rédigez une synthèse en 5-7 phrases sur les caractéristiques du jeu de données (dimensions, types des variables) et les traitements qui ont été réalisés (données manquantes, aberrantes, variables trop corrélées, raccourcissement des labels, codification des variables ordinales).
+                Rédigez une synthèse en 5-7 phrases sur les caractéristiques du jeu de données (dimensions, types des variables) et les traitements qui ont ét réalisés (données manquantes, aberrantes, variables trop corrélées, raccourcissement des labels, codification des variables ordinales).
                 S'il y en a, interprétez les corrélations entre les variables avec des valeurs manquantes: matrice, dendrogramme, et test de Little, et les implications pour le traitement des valeurs manquantes, tout particulièrement les résultats au test de Little.
                 Ainsi que le traitement des valeurs aberrantes (par défaut le taux de contamination utilisé est de 0.1%.). 
                 Les documents de la préparation sont fournis plus bas.
@@ -740,7 +775,19 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     # affichage final (sections repliees par defaut)
     if show_insights:
         with st.expander("Principaux insights", expanded=False):
-            st.markdown(st.session_state.get("global_synthesis", "Aucune synthèse disponible"))
+            brief_intro = ""
+            if dataset_key_questions_mode == "ab":
+                bq = str(dataset_key_questions or "").strip()
+                if bq:
+                    target_hint = st.session_state.get("brief_target_variable")
+                    target_txt = f" (cible détectée : {target_hint})" if target_hint else ""
+                    brief_intro = f"**Question du brief :** {bq}{target_txt}"
+
+            gs_text = st.session_state.get("global_synthesis")
+            if not isinstance(gs_text, str) or not gs_text.strip():
+                gs_text = "Aucune synthèse disponible"
+            combined = "\n\n".join([x for x in [brief_intro, gs_text] if x])
+            st.markdown(combined)
 
     if profilage_selected:
         with st.expander("Profilage", expanded=False):
@@ -845,7 +892,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             st.markdown(st.session_state.get("data_preparation_synthesis", "Aucune synthèse technique disponible"))
             st.markdown(st.session_state.get("dataset_context", ""))
 
-    # Distributions détaillées (si cochées), placées après l’analyse technique
+    # Distributions détaillées (si cochées), placées après l'analyse technique
     if distribution_figures_selected and descriptive_selected:
         dist_items = (
             st.session_state.get("figs_variables_distribution", [])
@@ -877,16 +924,26 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             # Info verbatim si aucune synthèse
             if not syntheses_verbatim:
                 if st.session_state.get("verbatim_only_dataset"):
-                    st.info("Étape verbatim : dataset 100% texte, synthèse absente ou non générée.")
+                    st.info("étape verbatim : dataset 100% texte, synthèse absente ou non générée.")
                 elif verb_cols:
-                    st.info(f"Étape verbatim : {len(verb_cols)} colonne(s) texte traitée(s).")
+                    st.info(f"étape verbatim : {len(verb_cols)} colonne(s) texte traitée(s).")
     # =============================================================
     # GENERATION DU HTML
     # =============================================================
 
     if not st.session_state["final_report_ready"]:
         # Principaux insights
-        _rf_add_text(T0, st.session_state.get("global_synthesis"))        
+        brief_intro = ""
+        bq = str(dataset_key_questions or "").strip()
+        if bq:
+            target_hint = st.session_state.get("brief_target_variable")
+            target_txt = f" (cible détectée : {target_hint})" if target_hint else ""
+            brief_intro = f"**Question du brief :** {bq}{target_txt}"
+        gs_text = st.session_state.get("global_synthesis")
+        if not isinstance(gs_text, str) or not gs_text.strip():
+            gs_text = "Aucune synthèse disponible"
+        combined = "\n\n".join([x for x in [brief_intro, gs_text] if x])
+        _rf_add_text(T0, combined)        
         
         # Rapport
         _rf_add_text(T10, st.session_state.get("report_introduction"))
@@ -1224,7 +1281,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                     df_encoded_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
                 )
 
-        # Important : se repositionner au début
+        # Important : se repositionner au dé©but
         zip_buffer.seek(0)
         st.session_state["final_export_zip_bytes"] = zip_buffer.getvalue()
         st.session_state["final_report_ready"] = True
@@ -1234,9 +1291,9 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     # =============================================================
     export_bundle = st.session_state.get("final_export_zip_bytes")
     if export_bundle:
-        st.header("Export des fichiers de l'analyse")
+        st.markdown("##### Export des fichiers de l'analyse")
         st.download_button(
-            label="Télécharger le zip des fichiers",
+            label="Técharger le zip des fichiers",
             data=export_bundle,
             file_name="export_bundle.zip",
             mime="application/zip"
@@ -1255,11 +1312,24 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                     - le tableau détaillé des profils de la segmentation (avec tous les attributs significatifs pour chaque segment): "segmentation_detailed_profiles"\n
                 Davantage de fichiers sont disponibles dans chaque module.\n
             """)
+
+    logs = st.session_state.get("pipeline_execution_logs", [])
+    if logs:
+        with st.expander("Logs d'exécution des modules", expanded=False):
+            st.write("Variables cibles:", st.session_state.get("target_variables", []))
+            st.write("Variables illustratives:", st.session_state.get("illustrative_variables", []))
+            logs_df = pd.DataFrame(logs)
+            if not logs_df.empty:
+                keep_cols = [c for c in ["module", "status", "elapsed_sec"] if c in logs_df.columns]
+                st.dataframe(logs_df[keep_cols] if keep_cols else logs_df, use_container_width=True)
+            elapsed = st.session_state.get("pipeline_execution_seconds")
+            if isinstance(elapsed, (int, float)):
+                st.write("Temps execution pipeline (s):", round(float(elapsed), 2))
     # =============================================================
     # Fin de l'étape
     # =============================================================
 
-    st.markdown("#### Actions suivantes")
+    st.markdown("##### Actions suivantes")
     qa_col, change_col, reset_col = st.columns(3)
     with qa_col:
         if st.button("Posez une question", use_container_width=True):

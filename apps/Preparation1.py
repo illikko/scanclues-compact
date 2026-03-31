@@ -231,27 +231,26 @@ def run():
     # -------- 1) Upload --------
     # param
     
-    st.subheader("Upload")
     st.write("L'application scanClues permet de préparer et analyser vos jeux de données tabulaires. Une présentation est fournie ci-dessous.")
        
     with st.expander("A propos de l'application", expanded=False):
         st.write("""
             L'application scanClues permet de traiter les jeux de données tabulaires (fichiers CSV, excel), plus particulièrement:
-            - de préparer le jeu de données brut (nettoyage (données manquantes, anormales, doublons,...), et de l'enrichir (textes, dates, géolocalisation,...))
+            - de préparer le jeu de données brut : nettoyage (données manquantes, anormales, doublons,...), et de l'enrichir (textes, dates, géolocalisation,...)
             - d'analyser la distribution et la relation entre les variables
             - d'extraire des insights et des recommandations: profiling sur tout le jeu de données et sur une cible, de mesurer pour chaque segment les actions qui ont le plus d'impact sur la cible.
-            - de fournir un rapport HTML et des fichiers csv qui résument les analyses et insights extraits.
+            - de fournir un rapport dans l'appli et exportable sous forme de fichiers HTML et csvs qui résument les analyses et insights extraits.
             - de poser des questions sur l'analyse réalisée
             
             L'utilisateur doit intervenir à plusieurs étapes pour:\n
-            1- vérifier que le jeu de données correspond au format attendu (voir plus bas)\n
-            2- télécharger le jeu de données\n
-            3- sélectionner son objectif: préparation du jeu de données, et le profilage, et l'analyse descriptive) et en option définir ce qu'il cherche (brief)\n
-            4- lire l'analyse dans l'application et/ou la télécharger (fichiers HTML et CSVs)\n
-            5- poser des questions\n
+            0- vérifier que le jeu de données correspond au format attendu (voir plus bas)\n
+            1- upload : télécharger le jeu de données\n
+            2- sélectionner son objectif: préparation du jeu de données, et le profilage, et l'analyse descriptive et en option (avec ou sans brief) définir ce qu'il cherche\n
+            3- lire le rapport dans l'application et/ou la télécharger (fichiers HTML et CSVs)\n
+            4- poser des questions\n
             
-            Par défaut l'application exécute les 19 modules (dont le titre défile en haut de page) et produit une analyse standard.
-            L'icône en haut à droite indique si un traitement est en cours: il faut attendre quelques minutes entre les étapes 2- et 3-, puis 3- et 4-.
+            Les traitements en cours d'exécution sont affichés sous le menu: module (parmi les 34) et la fonction (parmi une centaine).
+            L'icône en haut à droite indique si un traitement est en cours: il faut attendre 1 minute entre les étapes 1- et 2-, puis plusieurs minutes entre 2- et 3- suivant les traitements demandés et la richesse du jeu de données.
                           
             L'application est particulièrement adaptée aux cas d'usage suivants : enquêtes, analyses marketing (CRM, web analytics...), RH (satisfaction, attrition...), open data, etc.
             
@@ -266,6 +265,7 @@ def run():
             Des cas d'usage sont présentés à cette adresse : https://www.scanclues.com/#cas-d-usage
             """)
 
+    st.subheader("Upload")
     with st.expander("Paramètres pour la préparation préliminaire", expanded=False):
 
         st.slider(
@@ -281,7 +281,7 @@ def run():
 
         st.slider("Nombre max. de caractères pour les noms de colonnes", min_value=5, max_value=120, value=50, key = "max_chars")
 
-    st.subheader("Téléchargement du fichier")
+    st.markdown("#### Téléchargement du fichier")
 
     # Choix de l'encodage
     encoding_choice = st.selectbox(
@@ -406,7 +406,7 @@ def run():
 
 
     # -------- 2) Nettoyage préliminaire --------
-    st.subheader("Nettoyage préliminaire")
+    st.markdown("##### Nettoyage préliminaire")
     df0 = st.session_state.df.copy()
 
     # Stats avant nettoyage
@@ -500,7 +500,7 @@ def run():
 
     # -------- 3) Selection des variables (supprimee) --------
     # Phase 3: toutes les colonnes nettoyees sont conservees automatiquement.
-    st.subheader("Selection des variables")
+    st.markdown("##### Selection des variables")
     st.info("Selection manuelle supprimee: toutes les colonnes sont conservees.")
 
     df_selected = df_neat.copy()
@@ -508,7 +508,7 @@ def run():
     st.dataframe(df_selected)
 
     # -------- 5) Reconnaissance automatique des types (LLM) --------
-    st.subheader("Reconnaissance des types de variables")
+    st.markdown("##### Reconnaissance des types de variables")
 
     df_types = st.session_state.df_selected.copy()
 

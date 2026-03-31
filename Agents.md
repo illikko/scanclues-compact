@@ -122,3 +122,10 @@ VÃ©rifier :
   - clÃ©s `session_state` impactÃ©es,
   - risques,
   - check-list de validation.
+## 10) Discipline encodage et prompts
+
+- Toujours ecrire/relire les fichiers en UTF-8 et verifier l'absence de sequences de type Ã, Â, ï¿½ apres modification.
+- En cas de contenu corrompu (mojibake), ne pas tenter de corriger a l'aveugle : stopper, restaurer une base saine ou demander une source intacte.
+- Ne jamais re-encoder un fichier en changeant de charset (UTF-8 <-> ISO-8859-1) sans restauration prealable.
+- Avant d'appeler un LLM, s'assurer que le prompt contient des accents lisibles ; sinon, corriger la source ou restaurer.
+- Pour tout ajout de bloc LLM conditionnel (ex. brief), prefixer le rendu utilisateur (UI et export) avec un bloc deterministe cote app si l'instruction LLM peut etre ignoree.
