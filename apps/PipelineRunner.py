@@ -580,6 +580,8 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
     st.session_state[PIPELINE_FORCE_AUTO_KEY] = True
     st.session_state["__PIPELINE_SILENT__"] = True
     st.session_state.pop("pipeline_sankey_context_error", None)
+    st.session_state["run_sankey_crosstabs"] = bool(selection.get("sankey_crosstabs"))
+    st.session_state["generate_distribution_figures"] = bool(selection.get("distribution_figures"))
 
     # Brief agent : active les flags/plan uniquement si le cadrage est prêt et mode 'ab'
     try:
@@ -721,5 +723,6 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
         st.dataframe(logs, use_container_width=True)
 
     return logs
+
 
 

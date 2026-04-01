@@ -15,17 +15,18 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 def run():
     mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
     pipeline_silent = bool(st.session_state.get("__PIPELINE_SILENT__", False))
+    display_enabled = not pipeline_silent
     generate_distribution_figures = bool(
         st.session_state.get("generate_distribution_figures", not pipeline_silent)
     )
 
     # Éviter les doublons en mode pipeline silencieux (DistributionsDetail produit déjà les figures)
-    if pipeline_silent:
-        st.session_state.setdefault("figs_variables_distribution", [])
+    st.session_state.setdefault("figs_variables_distribution", [])
+    if not generate_distribution_figures:
         st.session_state["figs_variables_distribution"] = st.session_state.get("figs_variables_distribution", [])
-        return
-    
-    st.header("Analyse de la distribution des variables")
+
+    if display_enabled:
+        st.header("Analyse de la distribution des variables")
 
     # Liste pour construire le tableau récapitulatif des modalités dominantes
     dominant_continues = []
@@ -289,6 +290,7 @@ def run():
 
     st.write("Vous pouvez lancer la prochaine étape dans le menu à gauche: Analyse des corrélations.")
     st.session_state["etape14_terminee"] = True
+
 
 
 

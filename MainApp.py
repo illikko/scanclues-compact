@@ -34,13 +34,13 @@ section[data-testid="stSidebar"] .stButton > button {
   line-height: 1.1 !important; min-height: 0 !important; font-size: 0.90rem !important;
 }
 section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div { margin-bottom: 0.25rem !important; }
-/* Grossit les labels du menu horizontal principal */
-div[role="radiogroup"] label,
-div[role="radiogroup"] label * {
+/* Grossit uniquement les labels du menu horizontal principal (aria-label Navigation) */
+div[role="radiogroup"][aria-label="Navigation"] label,
+div[role="radiogroup"][aria-label="Navigation"] label * {
   font-size: 2rem !important;
   line-height: 1.2 !important;
 }
-div[role="radiogroup"] label strong {
+div[role="radiogroup"][aria-label="Navigation"] label strong {
   font-size: 2rem !important;
 }
 </style>
@@ -172,7 +172,7 @@ st.session_state.setdefault(MODE_KEY, "automatique")
 
 # Navigation horizontale en haut de page
 nav_choice = st.radio(
-    "",
+    "Navigation",
     options=OPTIONS,
     format_func=_fmt,
     index=active_idx,

@@ -356,6 +356,8 @@ def render_pipeline_form() -> bool:
             "sankey_crosstabs": bool(sankey_crosstabs),
             "distribution_figures": bool(distribution_figures),
         }
+        st.session_state["run_sankey_crosstabs"] = bool(sankey_crosstabs)
+        st.session_state["generate_distribution_figures"] = bool(distribution_figures)
         # Sauvegarde explicite du brief pour les écrans suivants (clé distincte pour éviter les conflits widgets)
         st.session_state["dataset_key_questions_value_saved"] = st.session_state.get("dataset_key_questions_value", "")
         # Copie non liée à un widget pour les modules en aval (RapportFinal / QA)
@@ -425,3 +427,4 @@ def run():
         st.session_state["etape2_terminee"] = True
 
         st.success("Sélection enregistrée. Passez au Rapport Final.")
+
