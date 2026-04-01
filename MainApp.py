@@ -34,6 +34,15 @@ section[data-testid="stSidebar"] .stButton > button {
   line-height: 1.1 !important; min-height: 0 !important; font-size: 0.90rem !important;
 }
 section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div { margin-bottom: 0.25rem !important; }
+/* Grossit les labels du menu horizontal principal */
+div[role="radiogroup"] label,
+div[role="radiogroup"] label * {
+  font-size: 2rem !important;
+  line-height: 1.2 !important;
+}
+div[role="radiogroup"] label strong {
+  font-size: 2rem !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -134,8 +143,9 @@ def _fmt(num: str) -> str:
         "4": "Q&A",
     }.get(num, e["label"])
     done = bool(st.session_state.get(e["cle_session"], False))
-    suffix = " 🟢" if done else ""
-    return f"**{num} - {short}{suffix}**"
+    suffix = " ■" if done else ""
+    # Ajoute quatre espaces insécables pour aérer les onglets
+    return f"**{num} - {short}{suffix}**\u00a0\u00a0\u00a0\u00a0"
 
 def _goto(num: str):
     # Met à jour la sélection + URL, puis relance; le selectbox suit via 'index'
