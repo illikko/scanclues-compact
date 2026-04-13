@@ -1,16 +1,12 @@
 ﻿# MainApp.py
 import streamlit as st
-from auth import require_invite_code
 import os
 from core.df_registry import (
     init_df_registry,
     sync_aliases_from_registry,
     sync_registry_from_aliases,
 )
-
-
-# ----------------------- Authentification -----------------------
-require_invite_code()
+from legal.footer import render_footer
 
 # ----------------------- Config -----------------------
 st.set_page_config(
@@ -227,3 +223,4 @@ sync_aliases_from_registry()
 
 # si mode = automatique ET que l'étape vient d'être marquée terminée, on enchaîne
 _auto_next_if_completed(active_num, was_done_before_run)
+render_footer()

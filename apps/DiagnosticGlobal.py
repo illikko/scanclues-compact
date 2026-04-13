@@ -233,13 +233,13 @@ def render_pipeline_form() -> bool:
                 analyse_descriptive = st.checkbox(
                     "Analyse descriptive",
                     value=bool(current_selection.get("analyse_descriptive", True)),
-                    help="Inclut : relations statistiques et sémantique entre les variables, représentation graphique synthétique de ces relations (diagramme de Sankey et dendrogramme).",
+                    help="Inclut : les relations statistiques et sémantiques entre les variables, des représentations graphiques synthétiques de ces relations (diagramme de Sankey et dendrogramme).",
                 )
 
             sankey_crosstabs = st.checkbox(
                 "Analyse détaillée des tris croisés",
                 value=bool(current_selection.get("sankey_crosstabs", False)),
-                help="Inclut : tris croisés détaillés pour les couples les pertinents de variables.",
+                help="Inclut : tris croisés détaillés pour les couples de variables les plus pertinents.",
             )
 
             distribution_figures = st.checkbox(
@@ -279,6 +279,7 @@ def render_pipeline_form() -> bool:
                         max_value=20,
                         step=1,
                         key="num_quantiles",
+                        help="Nombre de quantiles pour la discrétisation des variables continues (5 par défaut)."
                     )
 
                     st.number_input(
@@ -287,6 +288,7 @@ def render_pipeline_form() -> bool:
                         max_value=50,
                         step=1,
                         key="distinct_threshold_continuous",
+                        help="Nombre maximum de modalités distinctes pour qu'une variable soit considérée comme continue (5 par défaut)."
                     )
 
                     st.slider(
@@ -295,14 +297,16 @@ def render_pipeline_form() -> bool:
                         max_value=0.99,
                         step=0.01,
                         key="mod_freq_min",
+                        help="Seuil de fréquence du mode à partir duquel une variable est considérée comme binaire (90% par défaut)."
                     )
 
                     st.slider(
-                        "Seuil V de Cramer (corrélations fortes)",
+                        "Taux de corrélation au delà duquel 2 variables sont redondantes",
                         min_value=0.50,
                         max_value=0.95,
                         step=0.01,
                         key="correlation_threshold_v",
+                        help="Seuil de redondance entre 2 variables mesuré par le taux d'information mutuelle (75% par défaut)."
                     )
 
                     st.slider(
@@ -311,6 +315,7 @@ def render_pipeline_form() -> bool:
                         max_value=20.0,
                         step=0.1,
                         key="outliers_percent_target",
+                        help="Pourcentage de valeurs aberrantes à détecter par la méthode d'isolation forest (1% par défaut)."
                     )
 
                 with colp2:
@@ -320,6 +325,7 @@ def render_pipeline_form() -> bool:
                         max_value=50,
                         step=1,
                         key="n_clusters_segmentation",
+                        help="Nombre de clusters pour la segmentation globale par Kmodes (10 par défaut)."
                     )
 
                     st.number_input(
@@ -328,6 +334,7 @@ def render_pipeline_form() -> bool:
                         max_value=20,
                         step=1,
                         key="n_clusters_target",
+                        help="Nombre de clusters pour l'identification des profils cibles par Kmodes (3 par défaut)."
                     )
 
                     st.number_input(
@@ -336,6 +343,7 @@ def render_pipeline_form() -> bool:
                         max_value=20,
                         step=1,
                         key="kmodes_n_init",
+                        help="Nombre d'initialisations pour le clustering par Kmodes (2 par défaut)."
                     )
 
                     st.slider(
@@ -344,6 +352,7 @@ def render_pipeline_form() -> bool:
                         max_value=0.99,
                         step=0.01,
                         key="high_freq_threshold",
+                        help="Seuil de fréquence du mode dominant pour l'affichage des modalités dans les profils de segmentation (90% par défaut)."
                     )
 
             submitted = st.form_submit_button("Lancer", type="primary")

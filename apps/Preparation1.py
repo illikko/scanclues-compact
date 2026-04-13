@@ -290,11 +290,20 @@ def run():
         index=0  # latin-1 par défaut
     )
 
+    # blocage des fichiers trop gros
+    MAX_FILE_SIZE_MB = 30
+
     uploaded_file = st.file_uploader(
         "Téléchargez le fichier (.csv ou .xlsx)",
         type=["csv", "xls", "xlsx"],
         key=f"upload_file_{st.session_state.get('__UPLOAD_NONCE__', 0)}",
     )
+
+    if uploaded_file is not None:
+        size_mb = uploaded_file.size / (1024 * 1024)
+        if size_mb > MAX_FILE_SIZE_MB:
+            st.error(f"Fichier trop volumineux ({size_mb:.1f} MB). Limite : {MAX_FILE_SIZE_MB} MB.")
+            st.stop()
 
     if uploaded_file:
         try:
