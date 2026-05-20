@@ -5,6 +5,10 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from core.df_registry import DFState, set_df
+from core.preparation_diagnostics import remove_preparation_diagnostic, set_preparation_diagnostic
+from utils import preparation_process
+
 
 MODE_KEY = "__NAV_MODE__"
 
@@ -206,6 +210,38 @@ def detect_ranked_groups(
     return groups
 
 
+def diagnose_ranked_groups(df: pd.DataFrame, min_ranks: int = 2) -> dict:
+    groups = detect_ranked_groups(df, min_ranks=min_ranks)
+    details = [
+        {
+            "base": group.base,
+            "n_ranks": len(group.key_cols_by_rank),
+            "key_columns": list(group.key_cols_by_rank.values()),
+            "weight_columns": list(group.weight_cols_by_rank.values()),
+        }
+        for group in groups
+    ]
+    diagnostic = {
+        "id": "ranked_multiple_responses",
+        "label": "Traiter les réponses multiples ordonnées",
+        "needed": bool(groups),
+        "reason": (
+            f"{len(groups)} groupe(s) détecté(s)"
+            if groups
+            else "Aucun groupe de réponses ordonnées détecté"
+        ),
+        "details": {
+            "groups": details,
+            "min_ranks": int(min_ranks),
+        },
+        "compute_module": "ReponsesMultiplesOrdonnees",
+        "render_module": "ReponsesMultiplesOrdonnees",
+        "available": True,
+    }
+    set_preparation_diagnostic(diagnostic)
+    return diagnostic
+
+
 # ----------------------------
 # 3) Application sur N groupes + merge + drop sources
 # ----------------------------
@@ -308,17 +344,20 @@ def run():
         df = st.session_state.df_ex_verbatim
     else:
         st.warning("Aucun dataset trouvé. Veuillez d'abord passer par l'application précédente.")
-
+        remove_preparation_diagnostic("ranked_multiple_responses")
+        st.stop()
     st.success("Fichier chargé.")
     st.dataframe(df.head(), use_container_width=True)
 
     # Détection groupes
     st.subheader("Détection automatique des groupes (choix_1, choix_2, ...)")
+    ranked_diagnostic = diagnose_ranked_groups(df, min_ranks=2)
     groups = detect_ranked_groups(df, min_ranks=2)
 
     if not groups:
         st.warning("Aucun groupe de colonnes ordonnées détecté.")
         st.session_state.df_ex_ordonnees = df
+        set_df(DFState.MULTI_ORD_DONE, df, step_name="ReponsesMultiplesOrdonnees/no-op")
         st.session_state["etape5_terminee"] = True
         return
 
@@ -369,7 +408,12 @@ def run():
                     drop_sources=drop_sources,
                 )
                 st.session_state.df_ex_ordonnees = df_final
+                set_df(DFState.MULTI_ORD_DONE, df_final, step_name="ReponsesMultiplesOrdonnees")
                 st.session_state.dropped = dropped
+                preparation_process(
+                    df_final,
+                    f"{len(groups)} groupe(s) de réponses multiples ordonnées encodé(s).",
+                )
 
                 st.success("Encodage terminé.")
                 st.dataframe(st.session_state.df_ex_ordonnees.head(), use_container_width=True)

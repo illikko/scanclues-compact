@@ -1,26 +1,27 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
 import matplotlib as mpl
 from openai import OpenAI
 import json
 import os
-import io
-import base64
-import plotly.io as pio
-import html as _html
-from io import BytesIO
-from zipfile import ZipFile, ZIP_DEFLATED
-
+import time
 from core.df_registry import init_df_registry
 from core.reset_state import reset_app_state
 from .CadrageAnalyse import _call_llm
-from .PipelineRunner import run_selected
+from .PipelineRunner import get_selected_module_plan, run_selected
 from ._report import (
     add_from_state, add_text, add_table, add_figure_auto, build_html_report,
-    add_text_html, add_table_html, build_html_report_with_tables, reset_report
+    add_text_html, add_table_html, reset_report
 )
+from core.progress_state import set_progress
+from core.report_export import build_export_zip, build_final_report_html
+
+import plotly.graph_objects as go
+import plotly.io as pio
+import streamlit.components.v1 as components
 
 MODE_KEY = "__NAV_MODE__"
+NAV_CONTEXT_KEY = "__NAV_CONTEXT__"
 
 
 # ========= OpenAI =========
@@ -46,168 +47,193 @@ def to_block(x):
         return x.head(20).to_string(index=False)
     return str(x)
 
-def _rf_add_text(title: str, text: str):
-    """Ajoute un bloc texte en HTML simple, en conservant les puces/retours."""
-    if not text:
+
+SECTION_INFO_TEXTS = {
+    "verbatims": (
+        "Cette section résume les colonnes de texte libre détectées dans le jeu de données. "
+        "Elle met en avant les thèmes ou messages dominants extraits des verbatims."
+    ),
+    "insights": (
+        "Cette section présente les enseignements les plus importants extraits automatiquement du jeu de données. "
+        "Elle met en avant les constats prioritaires, les signaux saillants et les points d'attention à retenir rapidement."
+    ),
+    "profilage": (
+        "Cette section décrit les profils ou segments les plus marquants observés dans les données. "
+        "Elle aide à comprendre quelles caractéristiques distinguent les groupes et quels facteurs sont associés à la cible analysée."
+    ),
+    "analyse_descriptive": (
+        "Cette section résume la structure du jeu de données et les principales relations entre variables. "
+        "Elle permet de visualiser les distributions, regroupements et dépendances avant une interprétation plus détaillée."
+    ),
+    "contexte": (
+        "Cette section précise le sujet du jeu de données et le rôle attendu de ses variables. "
+        "Elle fournit aussi des recommandations utiles pour relire les résultats dans leur contexte métier."
+    ),
+    "tris_croises": (
+        "Cette section détaille des croisements entre paires de variables jugées utiles pour l'analyse. "
+        "Elle permet de comparer les répartitions observées et de lire leur interprétation associée."
+    ),
+    "analyse_technique": (
+        "Cette section décrit les traitements de préparation appliqués au jeu de données. "
+        "Elle synthétise notamment le nettoyage, les valeurs manquantes, les aberrants et les transformations techniques réalisées."
+    ),
+    "distributions": (
+        "Cette section présente les distributions détaillées des variables sélectionnées sous forme de graphiques. "
+        "Elle aide à repérer les niveaux, dispersions, asymétries et modalités dominantes."
+    ),
+    "etapes_preparation": (
+        "Cette section liste les principales étapes de préparation appliquées au jeu de données. "
+        "Elle permet de retracer de manière synthétique les transformations successives avant l'analyse finale."
+    ),
+}
+
+
+SECTION_INFO_LABELS = {
+    "verbatims": "Synthèse des verbatims",
+    "insights": "Principaux insights",
+    "profilage": "Profilage",
+    "analyse_descriptive": "Analyse descriptive",
+    "contexte": "Contexte du jeu de données",
+    "tris_croises": "Tris croisés détaillés",
+    "analyse_technique": "Analyse technique du jeu de données",
+    "distributions": "Distributions détaillées",
+    "etapes_preparation": "Etapes des préparations",
+}
+
+
+def _expander_label(section_key: str) -> str:
+    base_label = SECTION_INFO_LABELS[section_key]
+    tooltip = str(SECTION_INFO_TEXTS.get(section_key, "")).replace('"', "&quot;")
+    return f'{base_label} [ℹ️](# "{tooltip}")' if tooltip else base_label
+
+def _preview_df_from_payload(columns, rows):
+    if not isinstance(columns, list) or not isinstance(rows, list) or not rows:
+        return None
+    try:
+        return pd.DataFrame(rows, columns=columns)
+    except Exception:
+        return None
+
+
+def _render_preparation2_details(details: dict) -> None:
+    if not isinstance(details, dict) or not details:
         return
-    title = _html.escape(title or "")
-    # on éhappe le contenu puis on le met dans <pre> pour garder les puces/lignes
-    body = _html.escape(str(text))
-    block = f"""
-<section style="margin:24px 0">
-  <h2 style="margin:0 0 8px 0;font-size:20px">{title}</h2>
-  <pre style="white-space:pre-wrap;margin:6px 0 10px 0;color:#444">{body}</pre>
-</section>
-"""
-    st.session_state.setdefault("_rf_blocks", []).append(block)
 
-def _rf_add_df(title: str, df: pd.DataFrame, intro: str | None = None, max_height: str | None = None):
-    """Ajoute un DataFrame en HTML avec scroll, et gère l'index intelligemment."""
-    if not isinstance(df, pd.DataFrame) or df.empty:
+    missing_values = details.get("missing_values", {}) or {}
+    if isinstance(missing_values, dict) and missing_values:
+        st.markdown("**Traitement des valeurs manquantes**")
+
+        dropped_columns = missing_values.get("dropped_columns") or []
+        if dropped_columns:
+            st.write("Colonnes supprimées car trop incomplètes : " + ", ".join(map(str, dropped_columns)))
+
+        dropped_rows = missing_values.get("dropped_rows")
+        if isinstance(dropped_rows, int) and dropped_rows > 0:
+            st.write(f"Lignes supprimées car trop incomplètes : {dropped_rows}")
+
+        remaining_missing_columns = missing_values.get("remaining_missing_columns") or []
+        if remaining_missing_columns:
+            st.write("Colonnes restant partiellement incomplètes : " + ", ".join(map(str, remaining_missing_columns)))
+
+        simple_imputation_columns = missing_values.get("simple_imputation_columns") or []
+        if simple_imputation_columns:
+            st.write("Imputation simple appliquée sur : " + ", ".join(map(str, simple_imputation_columns)))
+
+        hotdeck_stats = missing_values.get("hotdeck_stats") or {}
+        if isinstance(hotdeck_stats, dict) and hotdeck_stats:
+            st.markdown("Hot-deck simple")
+            hotdeck_df = pd.DataFrame(
+                [{"Colonne": str(col), "Valeurs imputées": int(count)} for col, count in hotdeck_stats.items()]
+            )
+            if not hotdeck_df.empty:
+                st.dataframe(hotdeck_df, use_container_width=True, hide_index=True)
+
+    rare_modalities = details.get("rare_modalities", {}) or {}
+    if isinstance(rare_modalities, dict):
+        grouped_columns = rare_modalities.get("grouped_columns") or []
+        if grouped_columns:
+            st.markdown("**Regroupement des modalités rares**")
+            st.write(", ".join(map(str, grouped_columns)))
+
+    second_pass = details.get("second_pass", {}) or {}
+    if isinstance(second_pass, dict):
+        dropped_columns = second_pass.get("dropped_columns") or []
+        if dropped_columns:
+            st.markdown("**Vérifications finales**")
+            st.write(
+                "Colonnes non informatives supprimées après nettoyage : "
+                + ", ".join(map(str, dropped_columns))
+            )
+
+
+def _render_preparation_details(payload: dict) -> None:
+    if not isinstance(payload, dict) or not payload:
+        st.info("Aucun détail de préparation disponible.")
         return
 
-    title = _html.escape(title or "")
-    intro_html = ""
-    if intro:
-        intro_html = f'<div style="color:#444;margin:6px 0 10px 0;white-space:pre-wrap">{_html.escape(str(intro))}</div>'
 
-    show_index = should_show_index(df)
-    
-    # Correction: styles CSS pour rendre le tableau responsive
-    table_html = df.to_html(
-        index=show_index, 
-        border=1, 
-        escape=False,
-        classes='dataframe table table-striped',
+    label_shortening = payload.get("label_shortening", {})
+    mapping_preview = _preview_df_from_payload(
+        label_shortening.get("mapping_columns"),
+        label_shortening.get("mapping_preview"),
     )
+    if isinstance(mapping_preview, pd.DataFrame) and not mapping_preview.empty:
+        st.markdown("**Raccourcissement des noms des colonnes: libellés avant / après**")
+        st.dataframe(mapping_preview, use_container_width=True)
 
-    style_wrap = "overflow-x:auto;"
-    if max_height:
-        style_wrap += f"max-height:{max_height};overflow-y:auto;"
-
-    block = f"""
-<section style="margin:24px 0">
-  <h2 style="margin:0 0 8px 0;font-size:20px">{title}</h2>
-  {intro_html}
-  <div style="{style_wrap}">{table_html}</div>
-</section>
-"""
-    st.session_state.setdefault("_rf_blocks", []).append(block)
-
-def _rf_add_image(title: str, img, intro: str | None = None, dpi: int = 120):
-    """
-    Accepte soit des bytes PNG, soit une Figure matplotlib.
-    Amélioré pour les images trop petites.
-    """
-    # 1) Normaliser en bytes
-    if hasattr(img, 'savefig'):  # Matplotlib Figure
-        buf = io.BytesIO()
-        # Correction: augmentation de la taille pour les petites images
-        original_size = img.get_size_inches()
-        if original_size[0] < 8:  # Si l'image est trop petite
-            img.set_size_inches(10, 8)  # Taille minimale pour la lisibilité
-        
-        img.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.1)
-        png_bytes = buf.getvalue()
-    elif isinstance(img, (bytes, bytearray, memoryview)):
-        png_bytes = bytes(img)
-    else:
-        return
-
-    # 2) Encoder et pousser le bloc HTML
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    intro_html = f'<div style="color:#444;margin:6px 0 10px 0;white-space:pre-wrap">{intro}</div>' if intro else ""
-    block = f"""
-<section style="margin:24px 0">
-  <h2 style="margin:0 0 8px 0;font-size:20px">{title}</h2>
-  {intro_html}
-  <img src="data:image/png;base64,{b64}" style="display:block;max-width:100%;height:auto;margin:8px 0 0 0"/>
-</section>
-"""
-    st.session_state.setdefault("_rf_blocks", []).append(block)
-
-
-def _rf_add_collapsible(title: str, inner_html: str):
-    """Ajoute un bloc repliable (<details>) pour les contenus détaillés."""
-    if not inner_html:
-        return
-    title = _html.escape(title or "")
-    block = f"""
-<section style="margin:24px 0">
-  <details style="background:#fafafa;border:1px solid #ddd;border-radius:6px;padding:12px">
-    <summary style="cursor:pointer;font-weight:600;font-size:16px">{title}</summary>
-    <div style="margin-top:12px">{inner_html}</div>
-  </details>
-</section>
-"""
-    st.session_state.setdefault("_rf_blocks", []).append(block)
-
-
-def _rf_add_sankey(title: str, sankey_base64: str, intro: str | None = None):
-    """Ajoute un diagramme Sankey en base64"""
-    if not sankey_base64:
-        return
-        
-    intro_html = f'<div style="color:#444;margin:6px 0 10px 0;white-space:pre-wrap">{intro}</div>' if intro else ""
-    block = f"""
-<section style="margin:24px 0">
-  <h2 style="margin:0 0 8px 0;font-size:20px">{title}</h2>
-  {intro_html}
-  <img src="data:image/png;base64,{sankey_base64}" style="display:block;max-width:100%;height:auto;margin:8px 0 0 0"/>
-</section>
-"""
-    st.session_state.setdefault("_rf_blocks", []).append(block)
-
-def _rf_add_sankey_html(title: str, fig, intro: str | None = None):
-    """Ajoute un diagramme Sankey interactif (HTML Plotly)"""
-    if fig is None:
-        return
-
-    # HTML Plotly autonome (PlotlyJS chargé via CDN)
-    sankey_html = pio.to_html(
-        fig,
-        full_html=False,
-        include_plotlyjs="cdn"
+    semantic_rows = label_shortening.get("semantic_types_preview") or []
+    semantic_columns = label_shortening.get("semantic_types_columns")
+    if not semantic_columns and semantic_rows:
+        semantic_columns = [str(k) for k in semantic_rows[0].keys()]
+    semantic_preview = _preview_df_from_payload(
+        semantic_columns,
+        semantic_rows,
     )
+    if isinstance(semantic_preview, pd.DataFrame) and not semantic_preview.empty:
+        st.markdown("**Types sémantiques détectés**")
+        st.dataframe(semantic_preview, use_container_width=True)
 
-    intro_html = f'<div style="color:#444;margin:6px 0 10px 0;white-space:pre-wrap">{intro}</div>' if intro else ""
-    block = f"""
-<section style="margin:24px 0">
-  <h2 style="margin:0 0 8px 0;font-size:20px">{title}</h2>
-  {intro_html}
-  {sankey_html}
-</section>
-"""
-    st.session_state.setdefault("_rf_blocks", []).append(block)
+    missing_values = payload.get("missing_values", {})
+    if missing_values.get("diagnostic"):
+        st.markdown("**Diagnostic des valeurs manquantes**")
+        st.write(missing_values.get("diagnostic"))
+    missing_preview = _preview_df_from_payload(
+        missing_values.get("table_columns"),
+        missing_values.get("table_preview"),
+    )
+    if isinstance(missing_preview, pd.DataFrame) and not missing_preview.empty:
+        st.dataframe(missing_preview, use_container_width=True)
+    if missing_values.get("little_test_result"):
+        st.caption(str(missing_values.get("little_test_result")))
 
+    structural_missing = payload.get("structural_missing", {})
+    if structural_missing.get("diagnostic"):
+        st.markdown("**Manquantes structurelles**")
+        st.write(structural_missing.get("diagnostic"))
+    structural_preview = _preview_df_from_payload(
+        structural_missing.get("candidates_columns"),
+        structural_missing.get("candidates_preview"),
+    )
+    if isinstance(structural_preview, pd.DataFrame) and not structural_preview.empty:
+        st.caption("Colonnes repérées comme potentiellement concernées par un mécanisme de non-réponse structurelle.")
+        st.dataframe(structural_preview, use_container_width=True)
 
-def _rf_add_crosstab(title: str, heatmap_base64: str, interpretation: str, intro: str | None = None):
-    """Ajoute un crosstab complet avec heatmap et interprétation"""
-    if not heatmap_base64:
-        return
-        
-    intro_html = f'<div style="color:#444;margin:6px 0 10px 0;white-space:pre-wrap">{intro}</div>' if intro else ""
-    
-    block = f"""
-<section style="margin:24px 0">
-  <h2 style="margin:0 0 8px 0;font-size:20px">{title}</h2>
-  {intro_html}
-  <img src="data:image/png;base64,{heatmap_base64}" style="display:block;max-width:100%;height:auto;margin:8px 0 0 0"/>
-  <div style="margin-top:16px;padding:12px;background:#f8f9fa;border-left:4px solid #007cba">
-    <strong>Interprétation :</strong><br>
-    {interpretation}
-  </div>
-</section>
-"""
-    st.session_state.setdefault("_rf_blocks", []).append(block)
+    outliers = payload.get("outliers", {})
+    outliers_preview = _preview_df_from_payload(
+        outliers.get("table_columns"),
+        outliers.get("table_preview"),
+    )
+    if outliers.get("removed") is not None:
+        st.markdown("**Outliers supprimés**")
+        removed_count = len(outliers.get("indices") or []) if outliers.get("removed") else 0
+        st.caption(f"Nombre de lignes supprimées : {removed_count}")
+    if isinstance(outliers_preview, pd.DataFrame) and not outliers_preview.empty:
+        st.dataframe(outliers_preview, use_container_width=True)
 
-# gérer les index des dataframes (la 1ère colonne disparait lorsqu'elle est en index)
-def should_show_index(df: pd.DataFrame) -> bool:
-    idx = df.index
-    is_default_range = isinstance(idx, pd.RangeIndex) and idx.start == 0 and idx.step == 1
-    has_name = bool(idx.name)  # None ou "" => pas de nom
-    return (not is_default_range) or has_name
-
+    prep2_details = payload.get("preparation2", {}).get("details")
+    if prep2_details:
+        st.markdown("**Détails complémentaires de préparation**")
+        _render_preparation2_details(prep2_details)
 
 def _show_sankey_screen(fig_obj, sankey_base64: str | None = None) -> bool:
     if fig_obj is None:
@@ -220,10 +246,6 @@ def _show_sankey_screen(fig_obj, sankey_base64: str | None = None) -> bool:
                 return False
         return False
 
-    import json
-    import plotly.graph_objects as go
-    import plotly.io as pio
-    import streamlit.components.v1 as components
 
     # 1) Essai direct
     try:
@@ -274,6 +296,27 @@ def _show_sankey_screen(fig_obj, sankey_base64: str | None = None) -> bool:
     st.warning(f"Diagramme Sankey non affichable dans l'écran (format inattendu: {type(fig_obj).__name__}).")
     return False
 
+
+def _navigate_to_qa() -> None:
+    st.session_state[NAV_CONTEXT_KEY] = "view"
+    st.session_state["__NAV_SELECTED__"] = "4"
+    try:
+        st.query_params["step"] = "4"
+    except Exception:
+        st.experimental_set_query_params(step="4")
+
+
+def _change_objectives() -> None:
+    st.session_state[NAV_CONTEXT_KEY] = "view"
+    st.session_state["etape2_terminee"] = False
+    st.session_state["etape40_terminee"] = False
+    st.session_state["etape41_terminee"] = False
+    st.session_state["__NAV_SELECTED__"] = "2"
+    try:
+        st.query_params["step"] = "2"
+    except Exception:
+        st.experimental_set_query_params(step="2")
+
 # gérer la taille des graphiques
 
 mpl.rcParams.update({
@@ -296,6 +339,8 @@ def run():
     st.session_state["_rf_blocks"] = []
     st.session_state["__DETAIL_SECTION_ADDED__"] = False
     mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
+    nav_context = str(st.session_state.get(NAV_CONTEXT_KEY, "view"))
+    passive_nav = nav_context == "view"
     
     # Initialisation des états
     if "final_report_ready" not in st.session_state:
@@ -391,49 +436,73 @@ def run():
     df_shortlabels = st.session_state.get("df_shortlabels")   
     ordinal_codification_mapping = st.session_state.get('ordinal_codification_mapping')
     df_encoded = st.session_state.get('df_encoded')
+    preparation_details_payload = st.session_state.get("preparation_details_payload", {})
+    details_preparation_selected = bool(st.session_state.get("details_preparation_selected", False))
 
     if dataset_key_questions_mode == "ab" and str(dataset_key_questions or "").strip():
         st.caption(f"Brief saisi: {dataset_key_questions}")
     progress_slot = st.empty()
 
+    def _set_rf_progress(value: int, label: str):
+        set_progress(value, label, phase="post_diagnostic")
+        progress_slot.progress(value, text=label)
+
     # Execution pipeline selectionne avant rendu final.
-    if st.session_state.get("pipeline_ready_to_run", False) and not st.session_state.get(
+    if (not passive_nav) and st.session_state.get("pipeline_ready_to_run", False) and not st.session_state.get(
         "pipeline_executed", False
     ):
         st.session_state["final_report_ready"] = False
         st.session_state["final_export_zip_bytes"] = None
         st.session_state["__PIPELINE_LABEL_REFRESHED__"] = False
 
-        def _render_progress():
-            module_name = st.session_state.get("pipeline_current_module", "")
-            fn_name = st.session_state.get("pipeline_current_function", "")
-            progress_slot.info(
-                f"Module en cours: {module_name}\n"
-                f"Fonction en cours: {fn_name or '-'}"
-            )
+        pipeline_selection = st.session_state.get("pipeline_selection", {})
+        module_plan = get_selected_module_plan(pipeline_selection)
+        total_expected = sum(float(item.get("expected_seconds", 0.0)) for item in module_plan) or 1.0
+        expected_by_label = {item["label"]: float(item.get("expected_seconds", 0.0)) for item in module_plan}
+        offset_by_label = {}
+        cumulative = 0.0
+        for item in module_plan:
+            offset_by_label[item["label"]] = cumulative
+            cumulative += float(item.get("expected_seconds", 0.0))
+
+        progress_bar = progress_slot.progress(0, text="Préparation de l'exécution...")
+        current_module_start = {"t": None}
+
+        def _refresh_progress(module_name: str | None = None, *, force_complete: bool = False):
+            current_label = module_name or st.session_state.get("pipeline_current_module", "") or "Exécution du pipeline"
+            if force_complete:
+                ratio = 1.0
+            else:
+                offset = float(offset_by_label.get(current_label, 0.0))
+                expected = float(expected_by_label.get(current_label, 0.0))
+                ratio = offset / total_expected
+                if expected > 0 and current_module_start["t"] is not None:
+                    elapsed = max(0.0, time.monotonic() - current_module_start["t"])
+                    ratio = min(1.0, (offset + min(elapsed, expected)) / total_expected)
+            progress_bar.progress(int(max(0.0, min(1.0, ratio)) * 100), text=f"Traitements en cours - module : {current_label}")
 
         def _on_progress(module_name: str):
             st.session_state["pipeline_current_module"] = module_name
             st.session_state["pipeline_current_function"] = ""
-            _render_progress()
+            current_module_start["t"] = time.monotonic()
+            _refresh_progress(module_name)
 
-        def _on_function(module_name: str, function_name: str):
-            st.session_state["pipeline_current_module"] = module_name
-            st.session_state["pipeline_current_function"] = function_name
-            _render_progress()
+        def _on_function(module_name: str, _function_name: str):
+            _refresh_progress(module_name)
 
-        with st.spinner("Execution pipeline en cours..."):
+        with st.spinner("Exécution des traitements en cours..."):
             run_selected(
-                st.session_state.get("pipeline_selection", {}),
+                pipeline_selection,
                 show_details=False,
                 progress_callback=_on_progress,
                 function_progress_callback=_on_function,
             )
-        progress_slot.empty()
+        _refresh_progress(force_complete=True)
+        _set_rf_progress(65, "Traitements terminés")
 
         status = st.session_state.get("pipeline_status", "completed")
         if status == "completed":
-            st.success("Execution pipeline terminee.")
+            st.session_state["__PIPELINE_SHOW_SUCCESS__"] = True
         elif status == "completed_with_skips":
             logs = st.session_state.get("pipeline_execution_logs", [])
             skipped = [x for x in logs if x.get("status") == "skipped"]
@@ -441,7 +510,7 @@ def run():
         else:
             halt = st.session_state.get("pipeline_halt") or {}
             st.error(
-                "Execution pipeline arretee. "
+                "Exécution des traitements arrêtée. "
                 f"Module: {halt.get('module', 'inconnu')} | "
                 f"Cause: {halt.get('cause', 'inconnue')} | "
                 f"Detail: {halt.get('error', 'non disponible')}"
@@ -463,7 +532,7 @@ def run():
 
     # Affichage de la synthàse verbatim uniquement si des colonnes verbatim sont détectées.
     if verb_cols or st.session_state.get("verbatim_only_dataset"):
-        with st.expander("Synthèse des verbatims", expanded=False):
+        with st.expander(_expander_label("verbatims"), expanded=False):
             if syntheses_verbatim:
                 st.text_area("Résumé", syntheses_verbatim, height=320)
             elif st.session_state.get("verbatim_only_dataset"):
@@ -475,7 +544,7 @@ def run():
                 st.write(", ".join(map(str, verb_cols)))
 
     # Contexte LLM minimal si absent (une seule fois)
-    if isinstance(df_ready, pd.DataFrame) and not st.session_state.get("__RF_CONTEXT_DONE__", False) and (
+    if (not passive_nav) and isinstance(df_ready, pd.DataFrame) and not st.session_state.get("__RF_CONTEXT_DONE__", False) and (
         not st.session_state.get("dataset_context") or not st.session_state.get("dataset_object")
     ):
         try:
@@ -498,7 +567,7 @@ def run():
     profilage_selected = bool(selection.get("profilage", False))
     descriptive_selected = bool(selection.get("analyse_descriptive", False))
     # Harmoniser avec les clés des checkboxes de DiagnosticGlobal et forcer l'affichage
-    # si des artefacts existent déjà  en session (évite de masquer les résultats produits).
+    # si des artefacts existent déjà en session (évite de masquer les résultats produits).
     sankey_crosstabs_selected = bool(
         st.session_state.get("run_sankey_crosstabs", selection.get("sankey_crosstabs", False))
         or st.session_state.get("sankey_pair_results")
@@ -565,13 +634,14 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
 
     proceed = False
     if mode == "automatique":
-        proceed = True
+        proceed = not passive_nav
     else:
         if st.button("Générer la synthèse par IA"):
             proceed = True
 
     if show_insights and proceed and not st.session_state.get("final_report_ready", False) and isinstance(df_ready, pd.DataFrame) and not df_ready.empty:
         try:
+            _set_rf_progress(72, "Synthèse générale")
             with st.spinner("Rédaction de la synthèse générale par LLM en cours..."):
                 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -715,12 +785,13 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
 
                 
     if mode == "automatique":
-        proceed = True
+        proceed = not passive_nav
     else:
         if st.button("Générer l'analyse technique par IA"):
             proceed = True
     if show_technical_text and proceed and not st.session_state.get("final_report_ready", False) and isinstance(df_ready, pd.DataFrame) and not df_ready.empty:
         try:
+            _set_rf_progress(86, "Synthèse technique")
             with st.spinner("Rédaction de la synthèse sur la préparation du jeu de données par LLM en cours..."):
                 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -774,7 +845,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
 
     # affichage final (sections repliees par defaut)
     if show_insights:
-        with st.expander("Principaux insights", expanded=False):
+        with st.expander(_expander_label("insights"), expanded=False):
             brief_intro = ""
             if dataset_key_questions_mode == "ab":
                 bq = str(dataset_key_questions or "").strip()
@@ -790,13 +861,13 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             st.markdown(combined)
 
     if profilage_selected:
-        with st.expander("Profilage", expanded=False):
+        with st.expander(_expander_label("profilage"), expanded=False):
             st.markdown("### Profils associés à la cible")
             st.markdown(st.session_state.get("profils_y_text", "Aucun texte disponible"))
             st.markdown("### Segmentation")
             st.markdown(st.session_state.get("segmentation_profiles_text", "Aucun texte disponible"))
 
-    has_sankey = sankey_diagram is not None and sankey_diagram != {}
+    has_sankey = (sankey_diagram is not None and sankey_diagram != {}) or bool(str(sankey_diagram_base64 or "").strip())
     sankey_text = str(st.session_state.get("sankey_interpretation_synthesis") or "").strip()
     acm_text = str(st.session_state.get("interpretationACM") or "").strip()
     dendro_text = str(st.session_state.get("dendrogram_interpretation") or "").strip()
@@ -804,16 +875,29 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     has_latent_df = isinstance(sankey_latents, pd.DataFrame) and not sankey_latents.empty
     has_descriptive_content = has_sankey or bool(sankey_text) or bool(acm_text) or bool(dendro_text) or bool(fig_dendro) or bool(latent_text) or has_latent_df
 
+    if False and (has_sankey or sankey_text):
+        if has_sankey:
+            st.markdown("### Principales relations entre les variables")
+            _show_sankey_screen(sankey_diagram, st.session_state.get("sankey_diagram_base64"))
+        if sankey_text:
+            st.markdown(sankey_text)
+    if False and (latent_text or has_latent_df):
+        st.markdown("### Dimensions latentes")
+        if latent_text:
+            st.markdown(latent_text)
+        if has_latent_df:
+            st.dataframe(sankey_latents)
 
     if descriptive_selected:
-        with st.expander("Analyse descriptive", expanded=False):
+        with st.expander(_expander_label("analyse_descriptive"), expanded=False):
             if has_descriptive_content:
-                if has_sankey:
-                    st.markdown("### Principales relations entre les variables :")
-                    _show_sankey_screen(sankey_diagram, st.session_state.get("sankey_diagram_base64"))
-                if sankey_text:
-                    st.markdown(sankey_text)
                 st.markdown("### Relations multivariées :")
+                if has_sankey or sankey_text:
+                    st.markdown("### Principales relations entre les variables")
+                    if has_sankey:
+                        _show_sankey_screen(sankey_diagram, st.session_state.get("sankey_diagram_base64"))
+                    if sankey_text:
+                        st.markdown(sankey_text)
                 if acm_text:
                     st.markdown(acm_text)
                 st.markdown("### Relations bivariées :")
@@ -839,56 +923,46 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                     st.error(f"Erreur LLM DiagramSankey: {llm_err}")
                     
     if descriptive_selected:
-        with st.expander("Contexte du jeu de données", expanded=False):
+        with st.expander(_expander_label("contexte"), expanded=False):
             st.markdown(st.session_state.get("dataset_object", "Aucune synthèse disponible"))
             st.markdown(st.session_state.get("dataset_recommendations", ""))
 
-        # Tris croisés détaillés (si cochés dans DiagnosticGlobal)
-        if sankey_crosstabs_selected:
-            results_store = st.session_state.get("sankey_pair_results", {})
-            crosstab_list = st.session_state.get("crosstabs_interpretation", [])
-            if (isinstance(results_store, dict) and results_store) or crosstab_list:
-                with st.expander("Tris croisés détaillés", expanded=False):
-                    if isinstance(results_store, dict) and results_store:
-                        pairs_sorted = sorted(results_store.items(), key=lambda kv: kv[1].get("v", 0), reverse=True)
-                        for _, res in pairs_sorted:
-                            var_x = res.get("var_x")
-                            var_y = res.get("var_y")
-                            interpretation = res.get("interpretation", "")
-                            heatmap_png = res.get("heatmap_png")
-                            if heatmap_png or interpretation:
-                                st.write(f"{T134} {var_x} - {var_y}")
-                                if isinstance(heatmap_png, str):
-                                    try:
-                                        import base64 as _b64
-                                        st.image(_b64.b64decode(heatmap_png), caption=T135)
-                                    except Exception:
-                                        st.image(heatmap_png, caption=T135)
-                                elif heatmap_png:
-                                    st.image(heatmap_png, caption=T135)
-                                if interpretation:
-                                    st.write(interpretation)
-                    elif crosstab_list:
-                        for item in crosstab_list:
-                            var_x = item.get("var_x")
-                            var_y = item.get("var_y")
-                            interpretation = item.get("interpretation", "")
-                            heatmap_png = item.get("heatmap_png")
-                            if heatmap_png or interpretation:
-                                st.write(f"{T134} {var_x} - {var_y}")
-                                if isinstance(heatmap_png, str):
-                                    try:
-                                        import base64 as _b64
-                                        st.image(_b64.b64decode(heatmap_png), caption=T135)
-                                    except Exception:
-                                        st.image(heatmap_png, caption=T135)
-                                elif heatmap_png:
-                                    st.image(heatmap_png, caption=T135)
-                                if interpretation:
-                                    st.write(interpretation)
+    # Tris croisés détaillés (si cochés dans DiagnosticGlobal ou déjà produits)
+    raw_crosstab_list = st.session_state.get("crosstabs_interpretation", [])
+    crosstab_list = []
+    if isinstance(raw_crosstab_list, list):
+        for item in raw_crosstab_list:
+            if isinstance(item, dict):
+                crosstab_list.append(item)
+    if sankey_crosstabs_selected or crosstab_list:
+        if crosstab_list:
+            with st.expander(_expander_label("tris_croises"), expanded=False):
+                for item in crosstab_list:
+                    var_x = item.get("var_x")
+                    var_y = item.get("var_y")
+                    interpretation = item.get("interpretation", "")
+                    heatmap_png = item.get("heatmap_png")
+                    ct_count = item.get("ct_count")
+                    metrics_caption = str(item.get("metrics_caption") or "").strip()
+                    if heatmap_png or interpretation:
+                        st.write(f"{T134} {var_x} - {var_y}")
+                        if isinstance(ct_count, pd.DataFrame) and not ct_count.empty:
+                            st.dataframe(ct_count, use_container_width=True)
+                        if isinstance(heatmap_png, str):
+                            try:
+                                import base64 as _b64
+                                st.image(_b64.b64decode(heatmap_png), caption=T135)
+                            except Exception:
+                                st.image(heatmap_png, caption=T135)
+                        elif heatmap_png:
+                            st.image(heatmap_png, caption=T135)
+                        if metrics_caption:
+                            st.caption(metrics_caption)
+                        if interpretation:
+                            st.write(interpretation)
 
     if prep_selected and descriptive_selected:
-        with st.expander("Analyse technique du jeu de données", expanded=False):
+        with st.expander(_expander_label("analyse_technique"), expanded=False):
             st.markdown(st.session_state.get("data_preparation_synthesis", "Aucune synthèse technique disponible"))
             st.markdown(st.session_state.get("dataset_context", ""))
 
@@ -899,7 +973,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             or st.session_state.get("figs_variables_distribution_detailed", [])
         )
         if dist_items:
-            with st.expander("Distributions détaillées", expanded=False):
+            with st.expander(_expander_label("distributions"), expanded=False):
                 for item in dist_items:
                     title = item.get("title", "Distribution")
                     png = item.get("png", b"")
@@ -907,7 +981,7 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                     st.image(png, caption="Histogramme de la distribution de la variable")
 
     if prep_selected:
-        with st.expander("Etapes des préparations", expanded=False):
+        with st.expander(_expander_label("etapes_preparation"), expanded=False):
             if isinstance(process, pd.DataFrame):
                 proc = process.copy()
                 if verb_cols:
@@ -921,6 +995,10 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
                 st.dataframe(proc, use_container_width=True)
             else:
                 st.info("Aucune étape de préparation disponible.")
+            if details_preparation_selected:
+                st.markdown("##### Détails de la préparation")
+                _render_preparation_details(preparation_details_payload)
+                
             # Info verbatim si aucune synthèse
             if not syntheses_verbatim:
                 if st.session_state.get("verbatim_only_dataset"):
@@ -932,366 +1010,21 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     # =============================================================
 
     if not st.session_state["final_report_ready"]:
-        # Principaux insights
-        brief_intro = ""
-        bq = str(dataset_key_questions or "").strip()
-        if bq:
-            target_hint = st.session_state.get("brief_target_variable")
-            target_txt = f" (cible détectée : {target_hint})" if target_hint else ""
-            brief_intro = f"**Question du brief :** {bq}{target_txt}"
-        gs_text = st.session_state.get("global_synthesis")
-        if not isinstance(gs_text, str) or not gs_text.strip():
-            gs_text = "Aucune synthèse disponible"
-        combined = "\n\n".join([x for x in [brief_intro, gs_text] if x])
-        _rf_add_text(T0, combined)        
-        
-        # Rapport
-        _rf_add_text(T10, st.session_state.get("report_introduction"))
-        _rf_add_text(T11, st.session_state.get("dataset_object"))      
-
-        # AFFICHAGE DU DIAGRAMME SANKEY
-        sankey_diagram = st.session_state.get("sankey_diagram")
-        if sankey_diagram is not None:
-            _rf_add_sankey_html(
-                T13,
-                sankey_diagram,
-                intro=T131
-            )
-
-        _rf_add_text("", st.session_state.get("sankey_interpretation_synthesis"))
-
-        # crosstabs (section séparée, si demandé ou si artefacts existants)
-        if sankey_crosstabs_selected:
-            results_store = st.session_state.get("sankey_pair_results", {})
-            crosstab_list = st.session_state.get("crosstabs_interpretation", [])
-            parts = []
-            import base64 as _b64
-
-            if isinstance(results_store, dict) and results_store:
-                pairs_sorted = sorted(
-                    results_store.items(),
-                    key=lambda kv: kv[1].get("v", 0),
-                    reverse=True
-                )
-                for pair_id, res in pairs_sorted:
-                    var_x = res.get("var_x")
-                    var_y = res.get("var_y")
-                    interpretation = res.get("interpretation", "")
-                    heatmap_png = res.get("heatmap_png")
-                    img_html = ""
-                    if isinstance(heatmap_png, str):
-                        b64 = heatmap_png
-                    elif isinstance(heatmap_png, (bytes, bytearray, memoryview)):
-                        b64 = _b64.b64encode(bytes(heatmap_png)).decode("ascii")
-                    else:
-                        b64 = ""
-                    if b64:
-                        img_html = f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto;border:1px solid #ddd;border-radius:4px'/>"
-                    if img_html or interpretation:
-                        parts.append(
-                            f"<div style='margin-bottom:16px'><h4 style='margin:0 0 6px 0'>{_html.escape(str(var_x))} vs {_html.escape(str(var_y))}</h4>{img_html}<pre style='white-space:pre-wrap;color:#444;margin-top:6px'>{_html.escape(str(interpretation))}</pre></div>"
-                        )
-
-            if not parts and crosstab_list:
-                for item in crosstab_list:
-                    var_x = item.get("var_x")
-                    var_y = item.get("var_y")
-                    interpretation = item.get("interpretation", "")
-                    heatmap_png = item.get("heatmap_png")
-                    img_html = ""
-                    if isinstance(heatmap_png, str):
-                        b64 = heatmap_png
-                    elif isinstance(heatmap_png, (bytes, bytearray, memoryview)):
-                        b64 = _b64.b64encode(bytes(heatmap_png)).decode("ascii")
-                    else:
-                        b64 = ""
-                    if b64:
-                        img_html = f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto;border:1px solid #ddd;border-radius:4px'/>"
-                    if img_html or interpretation:
-                        parts.append(
-                            f"<div style='margin-bottom:16px'><h4 style='margin:0 0 6px 0'>{_html.escape(str(var_x))} vs {_html.escape(str(var_y))}</h4>{img_html}<pre style='white-space:pre-wrap;color:#444;margin-top:6px'>{_html.escape(str(interpretation))}</pre></div>"
-                        )
-
-            if parts:
-                _rf_add_collapsible(
-                    "Tris croisés détaillés",
-                    "".join(parts),
-                )
-
-        if syntheses_verbatim:
-            _rf_add_text(T15, syntheses_verbatim)
-        elif st.session_state.get("verbatim_only_dataset"):
-            _rf_add_text(T15, "Dataset 100% verbatim détecté, mais aucune synthèse n'a été générée.")
-
-        if profils_y_text is not None:
-            _rf_add_text(T21, st.session_state.get("profils_y_text"))
-
-        if isinstance(st.session_state.get("profils_y"), pd.DataFrame):
-            _rf_add_df(
-                T211,
-                st.session_state["profils_y"],
-                intro=T212,
-                max_height="480px",
-            )  
-              
-        _rf_add_text(T22, st.session_state.get("segmentation_profiles_text"))
-        
-        segmentation_profiles_table = st.session_state.get("segmentation_profiles_table")
-        if isinstance(segmentation_profiles_table, pd.DataFrame):
-            _rf_add_df(
-                T221,
-                segmentation_profiles_table,
-                intro=T222,
-                max_height="480px",
-            )
-
-        # analyse descriptive (analyse univariée, bivariée, mutlivariée)
-        _rf_add_text(T31, st.session_state.get("interpretationACM"))
-        _rf_add_text(T32, st.session_state.get("dendrogram_interpretation"))
-        
-        # affichage du dendrogramme des corrélations
-        if "dendrogram" in st.session_state:
-            _rf_add_image(
-                title=T33,
-                img=st.session_state["dendrogram"],
-                dpi=120,
-                intro=T331
-            )
-
-        if "latent_summary_text" in st.session_state:
-            _rf_add_text(T34, st.session_state.get("latent_summary_text"))
-            
-
-        if isinstance(st.session_state.get("sankey_latents"), pd.DataFrame):
-            _rf_add_df(
-                "",
-                st.session_state["sankey_latents"],
-                intro=T34,
-                max_height="480px",
-            )
-        # Introduction de la section descriptive détaillée
-        _rf_add_text(T35, T351)
-
-        # Affichage des histogrammes de toutes les variables (si l'option est active ou si des artefacts existent)
-        if distribution_figures_selected:
-            dist_items = (
-                st.session_state.get("figs_variables_distribution", [])
-                or st.session_state.get("figs_variables_distribution_detailed", [])
-            )
-            for item in dist_items:
-                _rf_add_image(
-                    title=item.get("title", "Distribution"),
-                    img=item.get("png", b""),
-                    intro=T3521,
-                )
-
-        if isinstance(dominant_continues, pd.DataFrame):
-            _rf_add_df(
-                T351,
-                dominant_continues,
-                intro=T351,
-                max_height="480px",
-            )
-
-        if isinstance(dominant_discretes, pd.DataFrame):
-            _rf_add_df(
-                T351,
-                dominant_discretes,
-                intro=T351,
-                max_height="480px",
-            )
-        # profil dominant
-        _rf_add_text(T352, st.session_state.get("profil_dominant_analysis"))
-
-        # Analyse technique du jeu de données
-        _rf_add_text(T41, st.session_state.get("data_preparation_synthesis"))    
-        _rf_add_text(T42, st.session_state.get("dataset_context"))
-        _rf_add_text(T43, st.session_state.get("dataset_characteristics"))
-
-        if isinstance(st.session_state.get("variables_raw"), pd.DataFrame):
-            _rf_add_df(
-                T44,
-                st.session_state["variables_raw"],
-                intro=T451,
-                max_height="600px", 
-            )
-            
-        _rf_add_text(T45, st.session_state.get("missing_values"))
-    
-        if "fig_missing_percentages" in st.session_state:
-            _rf_add_image(
-                title=T451,
-                img=st.session_state["fig_missing_percentages"],
-                intro=T4611
-            )
-            
-        if "fig_missing_correlation_heatmap" in st.session_state:
-            _rf_add_image(
-                title=T452,
-                img=st.session_state["fig_missing_correlation_heatmap"],
-                dpi=150,
-                intro=T4521
-            )
-
-        if "fig_missing_correlation_dendrogram" in st.session_state:
-            _rf_add_image(
-                title=T453,
-                img=st.session_state["fig_missing_correlation_dendrogram"],
-                intro=T4531
-            )           
-        
-        
-        _rf_add_text(T454, st.session_state.get("little_test_result"))
-
-        if isinstance(st.session_state.get("process"), pd.DataFrame):
-            _rf_add_df(
-                T461,
-                st.session_state["process"],
-                intro=T461,
-                max_height="480px",
-            )
-        
-        shortened_labels_mapping = st.session_state.get('shortened_labels_mapping')     
-        if isinstance(shortened_labels_mapping, pd.DataFrame):
-            _rf_add_df(
-                T462,
-                shortened_labels_mapping,
-                intro=T462,
-                max_height="480px",
-            )
-
-        ordinal_codification_mapping = st.session_state.get('ordinal_codification_mapping')     
-        if isinstance(ordinal_codification_mapping, pd.DataFrame):
-            _rf_add_df(
-                T463,
-                ordinal_codification_mapping,
-                intro=T463,
-                max_height="480px",
-            )
-
-        # construction une seule fois
-        html = build_html_report_with_tables(title=T100)
-        # CSS minimal pour une police lisible et pas de gros blancs autour des images
-        _css = """
-        <style>
-        table { font-size:14px; border-collapse:collapse; }
-        th, td { border:1px solid #e5e7eb; padding:6px 8px; vertical-align:top; }
-        img { display:block; margin:0; max-width:100%; height:auto; }
-        /* Correction: styles ameliores pour les tableaux */
-        .dataframe { 
-            width: 100%; 
-            table-layout: fixed;
-            word-wrap: break-word;
-        }
-        .dataframe th, .dataframe td {
-            max-width: 300px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-        </style>
-        """
-        extra = "".join(st.session_state.get("_rf_blocks", []))
-        st.session_state["_rf_blocks"] = []  # on purge pour éviter les doublons au rerun
-
-        if "</body>" in html:
-            html = html.replace("</body>", _css + extra + "</body>")
-        else:
-            html = _css + html + extra
-
-        st.session_state["final_report_html"] = html    
-
-        # =============================================================
-        # CONSTRUCTION DU PACKETS DE FICHIERS
-        # =============================================================
-        
-        html_report = st.session_state.get("final_report_html")
-
-        
-        # --- EXPORT DES FICHIERS ---
-
-        # --- Construction du ZIP en mémoire ---
-        zip_buffer = BytesIO()
-        df_ready_zip = st.session_state.get("df_ready")
-        segmentation_profiles_table_zip = st.session_state.get("segmentation_profiles_table")
-        segmentation_detailed_profiles_zip = st.session_state.get("segmentation_detailed_profiles")
-        profils_y_table_zip = st.session_state.get("profils_y_table")
-        profils_y_detailed_zip = st.session_state.get("profils_y_detailed")
-        shortened_labels_mapping_zip = st.session_state.get("shortened_labels_mapping")
-        df_shortlabels_zip = st.session_state.get("df_shortlabels")
-        ordinal_codification_mapping_zip = st.session_state.get("ordinal_codification_mapping")
-        df_encoded_zip = st.session_state.get("df_encoded")
-
-        with ZipFile(zip_buffer, mode="w", compression=ZIP_DEFLATED) as zf:
-            # HTML
-            zf.writestr("report.html", html_report.encode("utf-8"))
-                    
-            # CSV (UTF-8 avec BOM + séparateur)
-            if isinstance(df_ready_zip, pd.DataFrame):
-                zf.writestr(
-                    "df_ready.csv",
-                    df_ready_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
-                )        
-            
-            if isinstance(segmentation_profiles_table_zip, pd.DataFrame):
-                zf.writestr(
-                    "segmentation_profiles_table.csv",
-                    segmentation_profiles_table_zip.to_csv(sep=";", index=True).encode("latin-1", errors="replace")
-                )
-            
-            if isinstance(segmentation_detailed_profiles_zip, pd.DataFrame):
-                zf.writestr(
-                    "segmentation_detailed_profiles.csv",
-                    segmentation_detailed_profiles_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
-                )
-
-            if isinstance(profils_y_table_zip, pd.DataFrame):
-                zf.writestr(
-                    "profils_y_table.csv",
-                    profils_y_table_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
-                )
-
-            if isinstance(profils_y_detailed_zip, pd.DataFrame):
-                zf.writestr(
-                    "profils_y_detailed.csv",
-                    profils_y_detailed_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
-                )
-                
-            if isinstance(shortened_labels_mapping_zip, pd.DataFrame):
-                zf.writestr(
-                    "shortened_labels_mapping.csv",
-                    shortened_labels_mapping_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
-                )
-            
-            if isinstance(df_shortlabels_zip, pd.DataFrame):
-                zf.writestr(
-                    "df_shortlabels.csv",
-                    df_shortlabels_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
-                )
-
-            if isinstance(ordinal_codification_mapping_zip, pd.DataFrame):
-                zf.writestr(
-                    "ordinal_codification_mapping.csv",
-                    ordinal_codification_mapping_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
-                )
-
-            if isinstance(df_encoded_zip, pd.DataFrame):
-                zf.writestr(
-                    "df_encoded.csv",
-                    df_encoded_zip.to_csv(sep=";", index=False).encode("latin-1", errors="replace")
-                )
-
-        # Important : se repositionner au dé©but
-        zip_buffer.seek(0)
-        st.session_state["final_export_zip_bytes"] = zip_buffer.getvalue()
+        html = build_final_report_html(st.session_state, locals())
+        st.session_state["final_report_html"] = html
         st.session_state["final_report_ready"] = True
+        _set_rf_progress(100, "Rapport final prêt")
 
     # =============================================================
     # TELECHARGEMENT DU PACKAGE
     # =============================================================
+    st.markdown("##### Export des fichiers de l'analyse")
+    if st.button("Préparer le zip des fichiers", use_container_width=True):
+        html_report = st.session_state.get("final_report_html") or ""
+        st.session_state["final_export_zip_bytes"] = build_export_zip(st.session_state, html_report)
+
     export_bundle = st.session_state.get("final_export_zip_bytes")
     if export_bundle:
-        st.markdown("##### Export des fichiers de l'analyse")
         st.download_button(
             label="Técharger le zip des fichiers",
             data=export_bundle,
@@ -1322,9 +1055,28 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
             if not logs_df.empty:
                 keep_cols = [c for c in ["module", "status", "elapsed_sec"] if c in logs_df.columns]
                 st.dataframe(logs_df[keep_cols] if keep_cols else logs_df, use_container_width=True)
+                sankey_log = next(
+                    (
+                        item for item in logs
+                        if isinstance(item, dict)
+                        and item.get("module") == "DiagramSankey"
+                        and item.get("status") == "skipped"
+                    ),
+                    None,
+                )
+                if isinstance(sankey_log, dict):
+                    st.markdown("**Détail du log DiagramSankey**")
+                    st.json(sankey_log)
+                sankey_exit_debug = st.session_state.get("diagram_sankey_exit_debug")
+                if isinstance(sankey_exit_debug, dict) and sankey_exit_debug:
+                    st.markdown("**Trace interne DiagramSankey**")
+                    st.json(sankey_exit_debug)
             elapsed = st.session_state.get("pipeline_execution_seconds")
             if isinstance(elapsed, (int, float)):
                 st.write("Temps execution pipeline (s):", round(float(elapsed), 2))
+
+    if st.session_state.pop("__PIPELINE_SHOW_SUCCESS__", False):
+        st.success("Exécution des traitements terminée.")
     # =============================================================
     # Fin de l'étape
     # =============================================================
@@ -1332,31 +1084,9 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
     st.markdown("##### Actions suivantes")
     qa_col, change_col, reset_col = st.columns(3)
     with qa_col:
-        if st.button("Posez une question", use_container_width=True):
-            try:
-                st.query_params["step"] = "4"
-            except Exception:
-                st.experimental_set_query_params(step="4")
-            st.session_state["__NAV_SELECTED__"] = "4"
-            st.rerun()
+        st.button("Posez une question", use_container_width=True, on_click=_navigate_to_qa)
     with change_col:
-        if st.button("Changer les objectifs", use_container_width=True):
-            st.session_state["__DG_FORCE_RERUN__"] = True
-            st.session_state["pipeline_ready_to_run"] = False
-            st.session_state["pipeline_executed"] = False
-            st.session_state["pipeline_status"] = None
-            st.session_state["pipeline_halt"] = None
-            st.session_state["final_report_ready"] = False
-            st.session_state["final_export_zip_bytes"] = None
-            st.session_state["etape2_terminee"] = False
-            st.session_state["etape40_terminee"] = False
-            st.session_state["etape41_terminee"] = False
-            st.session_state["__NAV_SELECTED__"] = "2"
-            try:
-                st.query_params["step"] = "2"
-            except Exception:
-                st.experimental_set_query_params(step="2")
-            st.rerun()
+        st.button("Changer les objectifs", use_container_width=True, on_click=_change_objectives)
     with reset_col:
         if st.button("Réinitialiser", use_container_width=True):
             reset_app_state()

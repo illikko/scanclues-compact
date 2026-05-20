@@ -1,11 +1,163 @@
-import pandas as pd
 import numpy as np
+import io
+import os
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import streamlit as st
+from matplotlib.colors import ListedColormap
+from openai import OpenAI
+from scipy.stats import chi2_contingency
 
 from core.correlations_utils import (
+    DEFAULT_NUM_BINS,
     discretize_series_quantiles,
     fill_missing_for_discrete,
 )
 from utils import discretize_continuous_variables
+
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+def cramers_v(x, y):
+    data = pd.crosstab(x, y)
+    if data.empty or data.shape[0] < 2 or data.shape[1] < 2:
+        return np.nan, np.nan, np.nan
+
+    chi2, p, dof, expected = chi2_contingency(data)
+    n = data.values.sum()
+    phi2 = chi2 / n
+    r, k = data.shape
+    phi2_corr = max(0, phi2 - ((k - 1) * (r - 1)) / (n - 1)) if n > 1 else 0
+    r_corr = r - ((r - 1) ** 2) / (n - 1) if n > 1 else r
+    k_corr = k - ((k - 1) ** 2) / (n - 1) if n > 1 else k
+    if r_corr <= 1 or k_corr <= 1:
+        v = 0
+    else:
+        v = np.sqrt(phi2_corr / min((k_corr - 1), (r_corr - 1)))
+    return chi2, p, v
+
+
+def crosstab_with_std_residuals(df_cat, var_x, var_y):
+    if var_x not in df_cat.columns or var_y not in df_cat.columns:
+        return pd.DataFrame(), None, None
+
+    params = {
+        "num_quantiles": st.session_state.get("num_quantiles", DEFAULT_NUM_BINS),
+        "mod_freq_min": st.session_state.get("mod_freq_min", 0.9),
+        "distinct_threshold_continuous": st.session_state.get("distinct_threshold_continuous", 5),
+    }
+
+    df_local, _info = discretize_continuous_variables(
+        df_cat[[var_x, var_y]],
+        num_quantiles=params["num_quantiles"],
+        mod_freq_min=params["mod_freq_min"],
+        distinct_threshold_continuous=params["distinct_threshold_continuous"],
+        context_name="crosstab_with_std_residuals",
+    )
+
+    if not isinstance(df_local, pd.DataFrame):
+        df_local = df_cat[[var_x, var_y]].copy()
+
+    ct_count = pd.crosstab(df_local[var_x], df_local[var_y])
+    if ct_count.empty:
+        return ct_count, None, None
+
+    chi2, p, dof, expected = chi2_contingency(ct_count)
+    std_res = (ct_count - expected) / np.sqrt(expected)
+    ct_pct_row = pd.crosstab(df_local[var_x], df_local[var_y], normalize="index") * 100
+    return ct_count, ct_pct_row, std_res
+
+
+def interpret_crosstab_with_llm(var_x, var_y, ct_pct_row, std_res):
+    table_pct = ct_pct_row.round(1).to_string()
+    table_res = std_res.round(2).to_string()
+
+    crosstab_interpretation = f"""Réponds en français, clair et concis
+Tu es un data analyst expert (statistique + sémantique), en marketing si le jeu de données est un questionnaire.
+On te donne 3 tableaux :
+- un de contingence entre deux variables :
+    - Variable X : {var_x}
+    - Variable Y : {var_y}
+- un tableau des pourcentages en ligne (% par modalité de X) :
+{table_pct}
+- un tableau des résidus standardisés du Khi² (positif = sur-représentation, négatif = sous-représentation) :
+{table_res}
+
+Tâche :
+- Explique en 3 phrases les principaux résultats : quelles modalités de X sont particulièrement liées à quelles modalités de Y ?
+- utilise l'analyse déjà faite dans {st.session_state.get("dataset_context", "")}, en particulier pour comprendre la signification des variables et le contexte global.
+- N'utilise pas de termes techniques (résidus, Chi2, Khi², etc.), explique juste les relations entre modalités/variables, pas les tableaux.
+- Ne fais pas d'introduction ni de résumé.
+- Garde une explication concise et structurée.
+"""
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": crosstab_interpretation},
+            {"role": "user", "content": "réponds en fonction des instructions données dans role/system."},
+        ],
+        temperature=0,
+    )
+
+    content = response.choices[0].message.content
+    if not content or not content.strip():
+        return "(Interprétation indisponible – réponse LLM vide)"
+    return content
+
+
+def crosstab_heatmap_png(
+    frequencies,
+    residuals,
+    threshold: float = 2.0,
+    title: str | None = None,
+):
+    row_labels = frequencies.index.astype(str).tolist()
+    col_labels = frequencies.columns.astype(str).tolist()
+
+    max_col_len = max((len(lbl) for lbl in col_labels), default=0)
+    max_row_len = max((len(lbl) for lbl in row_labels), default=0)
+
+    if max_col_len > max_row_len:
+        frequencies = frequencies.T.copy()
+        residuals = residuals.T.copy()
+        row_labels, col_labels = col_labels, row_labels
+        if title and "×" in title:
+            left, right = title.split("×", 1)
+            title = f"{right.strip()} × {left.strip()}"
+
+    sign_map = np.zeros_like(frequencies.values, dtype=int)
+    sign_map[residuals.values > threshold] = 1
+    sign_map[residuals.values < -threshold] = -1
+
+    cmap = ListedColormap(["#fcb6b6", "white", "#b6fcb6"])
+    n_rows, n_cols = frequencies.shape
+
+    fig_width = max(4, n_cols * 0.9)
+    fig_height = max(3, n_rows * 0.6)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.imshow(sign_map, cmap=cmap, vmin=-1, vmax=1, aspect="auto")
+
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_xticklabels(col_labels, rotation=45, ha="right")
+    ax.set_yticklabels(row_labels)
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            val = frequencies.iat[i, j]
+            ax.text(j, i, f"{val:.1f}", ha="center", va="center", fontsize=8, color="black")
+
+    if title:
+        ax.set_title(title)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def discretize_for_display(s: pd.Series, n_bins: int):

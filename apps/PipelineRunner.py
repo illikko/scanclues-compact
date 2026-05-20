@@ -1,4 +1,4 @@
-﻿from contextlib import contextmanager
+from contextlib import contextmanager
 import os
 import sys
 import time
@@ -7,6 +7,11 @@ import pandas as pd
 import streamlit as st
 
 from .CadrageAnalyse import _call_llm
+from core.analysis_context_resolver import (
+    build_analysis_options,
+    default_pipeline_selection,
+    resolve_analysis_context,
+)
 from . import (
     AnalyseCorrelations,
     AnalyseFactorielle,
@@ -50,6 +55,28 @@ MODULE_LABELS = {
     "DistributionVariables": "Analyse descriptive des variables",
     "CrosstabsDetail": "Tris croises detailles",
     "DistributionsDetail": "Distributions detaillees",
+}
+
+
+MODULE_EXPECTED_SECONDS = {
+    "VerbatimSummary": 12,
+    "LabelShortening": 6,
+    "ReponsesMultiplesOrdonnees": 8,
+    "ReponsesMultiples": 8,
+    "ManquantesStructurelles": 10,
+    "Preparation2": 14,
+    "PreparationCorrelations": 10,
+    "Outliers": 10,
+    "CodificationOrdinales": 10,
+    "SeparationVariables": 8,
+    "Segmentation": 20,
+    "Profils_y": 16,
+    "AnalyseCorrelations": 14,
+    "AnalyseFactorielle": 18,
+    "DiagramSankey": 16,
+    "DistributionVariables": 14,
+    "CrosstabsDetail": 16,
+    "DistributionsDetail": 16,
 }
 
 
@@ -298,8 +325,17 @@ def _run_module(mod, name: str, logs: list[dict], progress_callback=None, functi
         entry = {"module": name, "status": "ok", "elapsed_sec": round(float(elapsed), 3)}
         if name == "DiagramSankey":
             sankey_obj = st.session_state.get("sankey_diagram")
+            sankey_b64 = str(st.session_state.get("sankey_diagram_base64") or "").strip()
+            latent_text = str(st.session_state.get("latent_summary_text") or "").strip()
+            latent_df = st.session_state.get("sankey_latents")
             has_sankey = sankey_obj is not None and sankey_obj != {}
-            if not has_sankey:
+            has_latents = bool(latent_text) or (isinstance(latent_df, pd.DataFrame) and not latent_df.empty)
+            entry["phase"] = "after_run"
+            entry["has_sankey_diagram"] = has_sankey
+            entry["has_sankey_diagram_base64"] = bool(sankey_b64)
+            entry["has_latent_text"] = bool(latent_text)
+            entry["has_latent_df"] = isinstance(latent_df, pd.DataFrame) and not latent_df.empty
+            if not has_sankey and not sankey_b64 and not has_latents:
                 entry["status"] = "skipped"
                 entry["reason"] = "no_sankey_output"
         logs.append(entry)
@@ -311,6 +347,7 @@ def _run_module(mod, name: str, logs: list[dict], progress_callback=None, functi
             entry = {
                 "module": name,
                 "status": "skipped",
+                "phase": "during_run",
                 "cause": "module_called_st.stop",
                 "error": "Module ignore (st.stop).",
                 "elapsed_sec": round(float(elapsed), 3),
@@ -321,6 +358,7 @@ def _run_module(mod, name: str, logs: list[dict], progress_callback=None, functi
             entry = {
                 "module": name,
                 "status": "skipped",
+                "phase": "during_run",
                 "cause": "module_requested_rerun",
                 "error": "Module ignore (st.rerun).",
                 "elapsed_sec": round(float(elapsed), 3),
@@ -357,6 +395,30 @@ def _pick_df(*keys):
         if isinstance(df, pd.DataFrame) and not df.empty:
             return df
     return None
+
+
+def _diagram_sankey_readiness() -> dict:
+    df_ready = st.session_state.get("df_ready")
+    has_df_ready = isinstance(df_ready, pd.DataFrame) and not df_ready.empty
+    n_columns = int(df_ready.shape[1]) if has_df_ready else None
+    context_error_before = st.session_state.get("pipeline_sankey_context_error")
+    ensure_ok = False
+    if has_df_ready:
+        ensure_ok = bool(_ensure_sankey_variables())
+    context_error_after = st.session_state.get("pipeline_sankey_context_error")
+    target_variables = st.session_state.get("target_variables", []) or []
+    illustrative_variables = st.session_state.get("illustrative_variables", []) or []
+    return {
+        "ready": bool(has_df_ready and ensure_ok),
+        "has_df_ready": has_df_ready,
+        "n_columns": n_columns,
+        "ensure_sankey_variables_ok": ensure_ok,
+        "target_variables": target_variables,
+        "illustrative_variables": illustrative_variables,
+        "brief_target_variable": st.session_state.get("brief_target_variable"),
+        "pipeline_sankey_context_error_before": context_error_before,
+        "pipeline_sankey_context_error_after": context_error_after,
+    }
 
 
 def _ensure_cadrage_context(df_source: pd.DataFrame | None):
@@ -503,7 +565,7 @@ def _ensure_sankey_variables() -> bool:
 
 def _ready_for(name: str) -> bool:
     if name == "DiagramSankey":
-        return _has_df("df_ready") and _sankey_size_ok() and _ensure_sankey_variables()
+        return bool(_diagram_sankey_readiness().get("ready"))
 
     reqs = {
         "VerbatimSummary": lambda: _has_df("df_raw"),
@@ -530,22 +592,29 @@ def _ready_for(name: str) -> bool:
 
 def _skip_entry(name: str) -> dict:
     if name == "DiagramSankey":
-        has_ready = _has_df("df_ready")
-        size_ok = _sankey_size_ok()
-        has_targets = bool(st.session_state.get("target_variables"))
-        has_illustratives = bool(st.session_state.get("illustrative_variables"))
-        entry = {"module": name, "status": "skipped", "reason": "missing_input_df"}
-        if has_ready and not size_ok:
-            entry["reason"] = "too_many_columns_for_sankey_pipeline"
-            df_ready = st.session_state.get("df_ready")
-            entry["n_columns"] = int(df_ready.shape[1]) if isinstance(df_ready, pd.DataFrame) else None
-            return entry
+        readiness = _diagram_sankey_readiness()
+        has_ready = bool(readiness.get("has_df_ready"))
+        has_targets = bool(readiness.get("target_variables"))
+        has_illustratives = bool(readiness.get("illustrative_variables"))
+        entry = {
+            "module": name,
+            "status": "skipped",
+            "reason": "missing_input_df",
+            "phase": "before_run",
+            "has_df_ready": readiness.get("has_df_ready"),
+            "n_columns": readiness.get("n_columns"),
+            "ensure_sankey_variables_ok": readiness.get("ensure_sankey_variables_ok"),
+            "target_variables": readiness.get("target_variables"),
+            "illustrative_variables": readiness.get("illustrative_variables"),
+            "brief_target_variable": readiness.get("brief_target_variable"),
+        }
+        context_error = readiness.get("pipeline_sankey_context_error_after") or readiness.get("pipeline_sankey_context_error_before")
+        if has_ready and not bool(readiness.get("ensure_sankey_variables_ok")):
+            entry["reason"] = "ensure_sankey_variables_failed"
         if has_ready and (not has_targets or not has_illustratives):
             entry["reason"] = "missing_target_or_illustrative_variables"
-            entry["target_variables"] = st.session_state.get("target_variables", [])
-            entry["illustrative_variables"] = st.session_state.get("illustrative_variables", [])
-            if st.session_state.get("pipeline_sankey_context_error"):
-                entry["context_error"] = st.session_state.get("pipeline_sankey_context_error")
+        if context_error:
+            entry["context_error"] = context_error
         return entry
     if name == "CrosstabsDetail":
         return {
@@ -566,6 +635,127 @@ def _skip_entry(name: str) -> dict:
     return {"module": name, "status": "skipped", "reason": "missing_input_df"}
 
 
+
+def _pipeline_module_groups():
+    """Ordonnancement canonique des modules du pipeline après DiagnosticGlobal."""
+    prep_base = [
+        (VerbatimSummary,              "VerbatimSummary"),
+        (LabelShortening,              "LabelShortening"),
+        (ReponsesMultiplesOrdonnees,   "ReponsesMultiplesOrdonnees"),
+        (ReponsesMultiples,            "ReponsesMultiples"),
+        (ManquantesStructurelles,      "ManquantesStructurelles"),
+        (Preparation2,                 "Preparation2"),
+    ]
+    prep_core = [
+        (PreparationCorrelations,      "PreparationCorrelations"),
+        (Outliers,                     "Outliers"),
+        (CodificationOrdinales,        "CodificationOrdinales"),
+        (SeparationVariables,          "SeparationVariables"),
+    ]
+    profilage = [
+        (Segmentation,                 "Segmentation"),
+        (Profils_y,                    "Profils_y"),
+    ]
+    descriptive = [
+        (AnalyseCorrelations,          "AnalyseCorrelations"),
+        (AnalyseFactorielle,           "AnalyseFactorielle"),
+        (DiagramSankey,                "DiagramSankey"),
+        (DistributionVariables,        "DistributionVariables"),
+        (CrosstabsDetail,              "CrosstabsDetail"),
+        (DistributionsDetail,          "DistributionsDetail"),
+    ]
+    return prep_base, prep_core, profilage, descriptive
+
+
+def _normalize_selection(selection: dict | None) -> dict:
+    base = default_pipeline_selection()
+    if isinstance(selection, dict):
+        base.update({k: bool(v) for k, v in selection.items() if k in base})
+    return base
+
+
+def _build_stage_plan(selection: dict) -> list[dict]:
+    selection = _normalize_selection(selection)
+    prep_base, prep_core, profilage, descriptive = _pipeline_module_groups()
+    stages: list[dict] = []
+    if selection.get("preparation", True):
+        stages.append({
+            "stage": "preparation_base",
+            "modules": [name for _, name in prep_base],
+        })
+        stages.append({
+            "stage": "preparation_core",
+            "modules": [name for _, name in prep_core],
+        })
+    if selection.get("profilage", False):
+        stages.append({
+            "stage": "profilage",
+            "modules": [name for _, name in profilage],
+        })
+    needs_descriptive = bool(
+        selection.get("analyse_descriptive", False)
+        or selection.get("sankey_crosstabs", False)
+        or selection.get("distribution_figures", False)
+    )
+    if needs_descriptive:
+        descriptive_modules = [name for _, name in descriptive]
+        if not selection.get("sankey_crosstabs"):
+            descriptive_modules = [name for name in descriptive_modules if name != "CrosstabsDetail"]
+        if not selection.get("distribution_figures"):
+            descriptive_modules = [name for name in descriptive_modules if name != "DistributionsDetail"]
+        stages.append({
+            "stage": "analyse_descriptive",
+            "modules": descriptive_modules,
+        })
+    return stages
+
+
+def get_selected_module_plan(selection: dict) -> list[dict]:
+    """Retourne le plan théorique des modules sélectionnés, sans filtrage par état intermédiaire."""
+    selection = _normalize_selection(selection)
+    if st.session_state.get("verbatim_only_dataset"):
+        return [{
+            "name": "VerbatimSummary",
+            "label": MODULE_LABELS.get("VerbatimSummary", "VerbatimSummary"),
+            "expected_seconds": float(MODULE_EXPECTED_SECONDS.get("VerbatimSummary", 1)),
+        }]
+
+    prep_base, prep_core, profilage, descriptive = _pipeline_module_groups()
+    ordered: list[tuple[object, str]] = []
+    if selection.get("preparation", True):
+        ordered.extend(prep_base + prep_core)
+    if selection.get("profilage", False):
+        ordered.extend(profilage)
+    needs_descriptive = bool(
+        selection.get("analyse_descriptive", False)
+        or selection.get("sankey_crosstabs", False)
+        or selection.get("distribution_figures", False)
+    )
+    if needs_descriptive:
+        ordered.extend(descriptive)
+
+    if not ordered:
+        ordered.extend(prep_base + prep_core)
+
+    plan: list[dict] = []
+    for _, name in ordered:
+        if name == "CrosstabsDetail" and not bool(selection.get("sankey_crosstabs")):
+            continue
+        if name == "DistributionsDetail" and not bool(selection.get("distribution_figures")):
+            continue
+        plan.append({
+            "name": name,
+            "label": MODULE_LABELS.get(name, name),
+            "expected_seconds": float(MODULE_EXPECTED_SECONDS.get(name, 10)),
+        })
+    return plan
+
+
+def get_selected_module_plan_total_seconds(selection: dict) -> float:
+    plan = get_selected_module_plan(selection)
+    total = sum(float(item.get("expected_seconds", 0.0)) for item in plan)
+    return float(total if total > 0 else 1.0)
+
 def run_selected(selection: dict, *, show_details: bool = False, progress_callback=None, function_progress_callback=None) -> list[dict]:
     """
     Execute les modules selon la selection utilisateur.
@@ -573,6 +763,7 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
     - profilage: segmentation + profils_y
     - analyse_descriptive: correlations/factorielle/sankey/distributions
     """
+    selection = _normalize_selection(selection)
     logs: list[dict] = []
     t0 = time.monotonic()
 
@@ -580,6 +771,12 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
     st.session_state[PIPELINE_FORCE_AUTO_KEY] = True
     st.session_state["__PIPELINE_SILENT__"] = True
     st.session_state.pop("pipeline_sankey_context_error", None)
+    st.session_state["pipeline_selection"] = selection
+    st.session_state["analysis_options"] = build_analysis_options(selection)
+    st.session_state["details_preparation_selected"] = bool(selection.get("details_preparation"))
+    st.session_state["analysis_context"] = resolve_analysis_context(st.session_state)
+    st.session_state["pipeline_execution_plan"] = get_selected_module_plan(selection)
+    st.session_state["pipeline_execution_stages"] = _build_stage_plan(selection)
     st.session_state["run_sankey_crosstabs"] = bool(selection.get("sankey_crosstabs"))
     st.session_state["generate_distribution_figures"] = bool(selection.get("distribution_figures"))
 
@@ -623,32 +820,7 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
             st.dataframe(verb_logs, use_container_width=True)
         return verb_logs
 
-    prep_base = [
-        (VerbatimSummary, "VerbatimSummary"),
-        (LabelShortening, "LabelShortening"),
-        (ReponsesMultiplesOrdonnees, "ReponsesMultiplesOrdonnees"),
-        (ReponsesMultiples, "ReponsesMultiples"),
-        (ManquantesStructurelles, "ManquantesStructurelles"),
-    ]
-    prep_core = [
-        (Preparation2, "Preparation2"),
-        (PreparationCorrelations, "PreparationCorrelations"),
-        (Outliers, "Outliers"),
-        (CodificationOrdinales, "CodificationOrdinales"),
-        (SeparationVariables, "SeparationVariables"),
-    ]
-    profilage = [
-        (Segmentation, "Segmentation"),
-        (Profils_y, "Profils_y"),
-    ]
-    descriptive = [
-        (AnalyseCorrelations, "AnalyseCorrelations"),
-        (AnalyseFactorielle, "AnalyseFactorielle"),
-        (DiagramSankey, "DiagramSankey"),
-        (DistributionVariables, "DistributionVariables"),
-        (CrosstabsDetail, "CrosstabsDetail"),
-        (DistributionsDetail, "DistributionsDetail"),
-    ]
+    prep_base, prep_core, profilage, descriptive = _pipeline_module_groups()
 
     halted = False
     halt_entry = None
@@ -682,7 +854,13 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
             else:
                 logs.append(_skip_entry(name))
 
-    if selection.get("analyse_descriptive", False) and not halted:
+    needs_descriptive = bool(
+        selection.get("analyse_descriptive", False)
+        or selection.get("sankey_crosstabs", False)
+        or selection.get("distribution_figures", False)
+    )
+
+    if needs_descriptive and not halted:
         # Assurer cadrage pour AnalyseCorrelations / DiagramSankey
         src = _pick_df("df_ready", "df_encoded", "df_imputed_structural")
         _ensure_cadrage_context(src)
@@ -723,6 +901,3 @@ def run_selected(selection: dict, *, show_details: bool = False, progress_callba
         st.dataframe(logs, use_container_width=True)
 
     return logs
-
-
-

@@ -322,7 +322,7 @@ def run():
             st.session_state["var_table_df"], all_vars, inferred_types, modalites_map
         )
 
-    with st.expander("â„¹ï¸ Explications sur le rôle des variables", expanded=False):
+    with st.expander("Explications sur le rôle des variables", expanded=False):
         st.write("""
             Les variables peuvent jouer plusieurs rôles: être cible, illustratives, ou médiatrices.\n
             - **Variable cible** : la variable que l'on cherche à analyser ou prédire.\n
@@ -375,7 +375,7 @@ def run():
         selected_targets = edited_df.loc[edited_df["cible"] == True, "variable"].tolist()
         if len(selected_targets) > 1:
             errors.append(
-                "â€¢ Merci de ne sélectionner quâ€™UNE seule variable cible (une seule case « cible » cochée)."
+                "Merci de ne sélectionner qu'UNE seule variable cible (une seule case « cible » cochée)."
             )
         
         for _, row in edited_df.iterrows():
@@ -386,7 +386,7 @@ def run():
             sens = (row.get("sens_cible") or "").strip().lower()
             modcat = (row.get("modalité_cat_cible") or "").strip()
             if vtype == "quantitative" and sens not in {"min", "max"}:
-                errors.append(f"â€¢ {var} (quant.) : choisir « min » ou « max ».") 
+                errors.append(f"Pour {var} (quant.) : choisir « min » ou « max ».") 
             if vtype == "catégorielle":
                 known = set(modalites_map.get(var, []))
                 if not modcat:

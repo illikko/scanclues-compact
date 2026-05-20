@@ -5,10 +5,14 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import prince
 from openai import OpenAI
-from typing import List  # pour l'annotation
+from typing import List
 
 
 MODE_KEY = "__NAV_MODE__"
+
+
+def _in_pipeline_mode() -> bool:
+    return bool(st.session_state.get("__PIPELINE_FORCE_AUTO__", False))
 
 # Client OpenAI (clé via variable d'env)
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -176,10 +180,28 @@ def validate_groups_both(groups: dict, coords: pd.DataFrame, cos2: pd.DataFrame,
                     errors.append(f"[Groupe {ax} - {side}] {label} |coord|={abs(coord_val):.3f} < seuil {coord_threshold}")
     return errors
 
+
+def _select_dataset(datasets_disponibles: dict[str, pd.DataFrame]) -> tuple[str, pd.DataFrame]:
+    preferred_labels = [
+        "Variables actives, ordinales encodées",
+        "Toutes les variables",
+        "Toutes les variables, ordinales encodées",
+    ]
+    if _in_pipeline_mode():
+        for label in preferred_labels:
+            if label in datasets_disponibles:
+                return label, datasets_disponibles[label].copy()
+        first_label = next(iter(datasets_disponibles))
+        return first_label, datasets_disponibles[first_label].copy()
+
+    choix = st.selectbox("Choisissez un dataset à utiliser :", list(datasets_disponibles.keys()), index=0)
+    return choix, datasets_disponibles[choix].copy()
+
 # App streamlit
 
 def run():
-    mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
+    pipeline_mode = _in_pipeline_mode()
+    mode = "automatique" if pipeline_mode else st.session_state.get(MODE_KEY, "automatique")
    
     # INIT DES ÉTATS PERSISTANTS
 
@@ -249,8 +271,7 @@ def run():
         st.warning("Aucun dataset *valide* trouvé. Veuillez d'abord passer par l'application précédente.")
         st.stop()
 
-    choix = st.selectbox("Choisissez un dataset à utiliser :", list(datasets_disponibles.keys()), index=0)
-    df = datasets_disponibles[choix].copy()
+    choix, df = _select_dataset(datasets_disponibles)
 
     st.success(f"{choix} chargé depuis l'application précédente.")
     st.write("Aperçu du dataset :")
@@ -267,7 +288,7 @@ def run():
         num_quantiles=num_quantiles,
         mod_freq_min=mod_freq_min,
         distinct_threshold_continuous=distinct_threshold_continuous,
-        context_name="apps/xxx.py étape 3"
+        context_name="apps/AnalyseFactorielle.py"
     )
 
     if info["errors"]:
@@ -344,37 +365,43 @@ def run():
     st.pyplot(fig)
 
     # ===============================
-    # ÉTAPE 3 · PARAMÃˆTRES D'INTERPRÉTATION
+    # ÉTAPE 3 · PARAMETRES D'INTERPRÉTATION
     # ===============================
     st.subheader("Sélection des paramètres pour l'interprétation")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.session_state.params["n_axes_display"] = st.slider(
-            "Nombre d'axes à interpréter",
-            min_value=1, max_value=10,
-            value=st.session_state.params["n_axes_display"],
-            step=1, key="axes_disp",
-        )
-    with col2:
-        st.session_state.params["cos2_threshold"] = st.select_slider(
-            "Seuil minimal de cos²",
-            options=[0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
-            value=st.session_state.params["cos2_threshold"], key="cos2_thr",
-        )
+    if pipeline_mode:
+        st.session_state.params["n_axes_display"] = max(1, min(10, int(st.session_state.params["n_axes_display"])))
+        st.session_state.params["cos2_threshold"] = float(st.session_state.params["cos2_threshold"])
+        st.session_state.params["coord_threshold"] = float(st.session_state.params["coord_threshold"])
+        st.session_state.params["topk_examples"] = max(0, min(14, int(st.session_state.params["topk_examples"])))
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state.params["n_axes_display"] = st.slider(
+                "Nombre d'axes à interpréter",
+                min_value=1, max_value=10,
+                value=st.session_state.params["n_axes_display"],
+                step=1, key="axes_disp",
+            )
+        with col2:
+            st.session_state.params["cos2_threshold"] = st.select_slider(
+                "Seuil minimal de cos²",
+                options=[0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+                value=st.session_state.params["cos2_threshold"], key="cos2_thr",
+            )
 
-    colA, colB = st.columns(2)
-    with colA:
-        st.session_state.params["coord_threshold"] = st.slider(
-            "Seuil minimal |coordonnée|",
-            min_value=0.10, max_value=1.50, value=st.session_state.params["coord_threshold"],
-            step=0.05, key="coord_thr",
-        )
-    with colB:
-        st.session_state.params["topk_examples"] = st.slider(
-            "Nombre de modalités par sous-groupe",
-            min_value=0, max_value=14, value=st.session_state.params["topk_examples"],
-            step=1, key="topk_examples",
-        )
+        colA, colB = st.columns(2)
+        with colA:
+            st.session_state.params["coord_threshold"] = st.slider(
+                "Seuil minimal |coordonnée|",
+                min_value=0.10, max_value=1.50, value=st.session_state.params["coord_threshold"],
+                step=0.05, key="coord_thr",
+            )
+        with colB:
+            st.session_state.params["topk_examples"] = st.slider(
+                "Nombre de modalités par sous-groupe",
+                min_value=0, max_value=14, value=st.session_state.params["topk_examples"],
+                step=1, key="topk_examples",
+            )
 
     # Recalcul du filtrage en live (et mémos coords/cos2)
     recompute_filtered_coords()
@@ -437,7 +464,7 @@ def run():
     # ===============================
     # ÉTAPE 4 · INTERPRÉTATION LLM
     # ===============================
-    st.subheader("Interprétation de lâ€™ACM")
+    st.subheader("Interprétation de l'ACM")
 
     proceed = False
     if mode == "automatique":
@@ -455,7 +482,7 @@ def run():
             try:
                 payload = st.session_state.get("llm_payload_text", "")
                 if not payload.strip():
-                    st.error("Aucun regroupement à envoyer. Validez lâ€™étape 3 dâ€™abord.")
+                    st.error("Aucun regroupement à envoyer. Validez l'étape 3 d'abord.")
                     st.stop()
 
                 system_msg = {
@@ -492,14 +519,14 @@ def run():
                 st.session_state.llm_done = True
 
             except Exception as e:
-                st.error(f"Une erreur est survenue lors de lâ€™appel à lâ€™API : {e}")
+                st.error(f"Une erreur est survenue lors de l'appel à l'API : {e}")
 
     if st.session_state.llm_done and st.session_state.interpretationACM:
         st.text_area("Interprétation de l'ACM", value=st.session_state.interpretationACM, height=420)
     else:
         st.info("Cliquez sur « Lancer l'interprétation de l'ACM par LLM ».")
 
-    st.write("âœ… Vous pouvez lancer la prochaine étape dans le menu à gauche: Segmentation.")
+    st.write("Vous pouvez lancer la prochaine étape dans le menu à gauche: Segmentation.")
     st.session_state["etape22_terminee"] = True
 
 

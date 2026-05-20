@@ -6,16 +6,21 @@ import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import os
 from openai import OpenAI
-import io
 import json
 import base64
 import plotly.io as pio
-
-from core.correlations_utils import DEFAULT_NUM_BINS
 from utils import discretize_continuous_variables
 
-
 MODE_KEY = "__NAV_MODE__"
+
+
+def _in_pipeline_mode() -> bool:
+    return bool(st.session_state.get("__PIPELINE_FORCE_AUTO__", False))
+
+
+def _fallback_profiles(all_vars, outcomes, limit=5):
+    excluded = set(outcomes or [])
+    return [var for var in all_vars if var not in excluded][:limit]
 
 # Client OpenAI global (accessible dans toutes les fonctions)
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -460,6 +465,58 @@ def assign_mediators_to_levels(links_df, profiles, outcomes, candidates, v_min=0
 # 3. Construction du Sankey
 # ==========================
 
+def extract_drawn_links(links_df: pd.DataFrame, levels: list[list[str]]) -> list[dict]:
+    """
+    Retourne les seuls liens effectivement dessinés dans le Sankey,
+    c.-à-d. les couples reliant deux niveaux successifs.
+    """
+    if not isinstance(links_df, pd.DataFrame) or links_df.empty or not levels:
+        return []
+
+    drawn_links: list[dict] = []
+    seen = set()
+
+    for k in range(len(levels) - 1):
+        from_level = levels[k]
+        to_level = levels[k + 1]
+        mask = (
+            (links_df["var_x"].isin(from_level) & links_df["var_y"].isin(to_level))
+            | (links_df["var_y"].isin(from_level) & links_df["var_x"].isin(to_level))
+        )
+        subset = links_df[mask]
+
+        for _, row in subset.iterrows():
+            x = row["var_x"]
+            y = row["var_y"]
+
+            if x in from_level and y in to_level:
+                source_var, target_var = x, y
+            elif y in from_level and x in to_level:
+                source_var, target_var = y, x
+            else:
+                continue
+
+            pair_id = row.get("pair_id")
+            dedupe_key = pair_id if pd.notna(pair_id) else (source_var, target_var)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            drawn_links.append(
+                {
+                    "pair_id": None if pd.isna(pair_id) else int(pair_id),
+                    "var_x": str(row["var_x"]),
+                    "var_y": str(row["var_y"]),
+                    "source_var": str(source_var),
+                    "target_var": str(target_var),
+                    "v": float(row["v"]) if pd.notna(row["v"]) else None,
+                    "p": float(row["p"]) if pd.notna(row["p"]) else None,
+                    "chi2": float(row["chi2"]) if pd.notna(row["chi2"]) else None,
+                }
+            )
+
+    return drawn_links
+
 def build_sankey_from_links(links_df, levels):
     """
     Construit un Sankey Plotly multi-niveaux à partir d'un DataFrame de liens
@@ -477,29 +534,14 @@ def build_sankey_from_links(links_df, levels):
     values = []
     colors = []
 
-    for k in range(len(levels) - 1):
-            from_level = levels[k]
-            to_level = levels[k + 1]
-            mask = ((links_df["var_x"].isin(from_level) & links_df["var_y"].isin(to_level)) |
-                    (links_df["var_y"].isin(from_level) & links_df["var_x"].isin(to_level)))
-            subset = links_df[mask]
-
-            for _, row in subset.iterrows():
-                x = row["var_x"]
-                y = row["var_y"]
-                v = row["v"]
-
-                if x in from_level and y in to_level:
-                    s_name, t_name = x, y
-                elif y in from_level and x in to_level:
-                    s_name, t_name = y, x
-                else:
-                    continue
-
-                sources.append(node_indices[s_name])
-                targets.append(node_indices[t_name])
-                values.append(v)
-                colors.append("rgba(0, 100, 200, 0.5)")
+    for row in extract_drawn_links(links_df, levels):
+        s_name = row["source_var"]
+        t_name = row["target_var"]
+        v = row["v"]
+        sources.append(node_indices[s_name])
+        targets.append(node_indices[t_name])
+        values.append(v)
+        colors.append("rgba(0, 100, 200, 0.5)")
 
     if not sources:
         return None
@@ -544,184 +586,6 @@ def sankey_to_base64(fig):
     png_bytes = pio.to_image(fig, format='png', width=1200, height=700)
     return base64.b64encode(png_bytes).decode('utf-8')
 
-# Génération des tris croisés
-from scipy.stats import chi2_contingency
-
-def crosstab_with_std_residuals(df_cat, var_x, var_y):
-    """
-    Renvoie :
-    - ct_count : tableau de contingence (effectifs)
-    - ct_pct_row : % en ligne
-    - std_res : résidus standardisés du Khi²
-    """
-    if var_x not in df_cat.columns or var_y not in df_cat.columns:
-        return pd.DataFrame(), None, None
-
-    params = {
-        "num_quantiles": st.session_state.get("num_quantiles", DEFAULT_NUM_BINS),
-        "mod_freq_min": st.session_state.get("mod_freq_min", 0.9),
-        "distinct_threshold_continuous": st.session_state.get("distinct_threshold_continuous", 5),
-    }
-
-    df_local, _info = discretize_continuous_variables(
-        df_cat[[var_x, var_y]],
-        num_quantiles=params["num_quantiles"],
-        mod_freq_min=params["mod_freq_min"],
-        distinct_threshold_continuous=params["distinct_threshold_continuous"],
-        context_name="crosstab_with_std_residuals",
-    )
-
-    if not isinstance(df_local, pd.DataFrame):
-        df_local = df_cat[[var_x, var_y]].copy()
-
-    ct_count = pd.crosstab(df_local[var_x], df_local[var_y])
-    if ct_count.empty:
-        return ct_count, None, None
-
-    chi2, p, dof, expected = chi2_contingency(ct_count)
-    # résidus standardisés
-    std_res = (ct_count - expected) / np.sqrt(expected)
-    ct_pct_row = pd.crosstab(df_local[var_x], df_local[var_y], normalize='index') * 100
-    return ct_count, ct_pct_row, std_res
-
-# interprétation par LLM des tris croisés
-
-def interpret_crosstab_with_llm(var_x, var_y, ct_pct_row, std_res):
-    """
-    Appel LLM pour interpréter le tableau de contingence var_x x var_y.
-    On fournit au modèle :
-    - % en ligne
-    - résidus standardisés
-    """
-    
-    # Représentation texte des tables
-    table_pct = ct_pct_row.round(1).to_string()
-    table_res = std_res.round(2).to_string()
-
-
-    crosstab_interpretation = f"""Réponds en français, clair et concis
-Tu es un data analyst expert (statistique + sémantique), en marketing si le jeu de données est un questionnaire.
-On te donne 3 tableaux :
-- un de contingence entre deux variables :
-    - Variable X : {var_x}
-    - Variable Y : {var_y}
-- un tableau des pourcentages en ligne (% par modalité de X) :
-{table_pct}
-- un tableau des résidus standardisés du Khi² (positif = sur-représentation, négatif = sous-représentation) :
-{table_res}
-
-Tâche :
-- Explique en 3 phrases les principaux résultats : quelles modalités de X sont particulièrement liées à quelles modalités de Y ?
-- utilise l'analyse déjà faite dans {st.session_state.get("dataset_context", "")}, en particulier pour comprendre la signification des variables et le contexte global.
-- N'utilise pas de termes techniques (résidus, Chi2, Khi², etc.), explique juste les relations entre modalités/variables, pas les tableaux.
-- Ne fais pas d'introduction ni de résumé.
-- Garde une explication concise et structurée.
-"""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": crosstab_interpretation
-            },
-            {
-                "role": "user",
-                "content": "réponds en fonction des instructions données dans role/system."
-            },
-        ],
-        temperature=0,
-    )
-
-    content = response.choices[0].message.content
-
-    if not content or not content.strip():
-        # En cas de réponse vide, on remonte une info exploitable
-        return "(Interprétation indisponible â€“ réponse LLM vide)"
-
-    return content
-
-
-from matplotlib.colors import ListedColormap
-
-def crosstab_heatmap_png(
-    frequencies,
-    residuals,
-    threshold: float = 2.0,
-    title: str | None = None,
-):
-    """
-    Crée une 'carte de chaleur' des fréquences avec sur/sous-représentations
-    et renvoie l'image au format PNG (bytes).
-
-    Si auto_flip=True et que les libellés des colonnes dépassent long_label_threshold,
-    on transpose pour que ces libellés se retrouvent en lignes.
-    """
-
-    # Libellés de modalités
-    row_labels = frequencies.index.astype(str).tolist()
-    col_labels = frequencies.columns.astype(str).tolist()
-
-    max_col_len = max((len(lbl) for lbl in col_labels), default=0)
-    max_row_len = max((len(lbl) for lbl in row_labels), default=0)
-
-    # ðŸ” Règle simple : si les colonnes ont des libellés longs, on les met en lignes
-    if max_col_len > max_row_len:
-        frequencies = frequencies.T.copy()
-        residuals = residuals.T.copy()
-        # On inverse les labels pour l'affichage
-        row_labels, col_labels = col_labels, row_labels
-
-        # Si le titre est du style "X × Y", on inverse X et Y
-        if title and "×" in title:
-            left, right = title.split("×", 1)
-            title = f"{right.strip()} × {left.strip()}"
-
-    # Matrice -1 / 0 / 1 selon les résidus (sous, neutre, sur)
-    sign_map = np.zeros_like(frequencies.values, dtype=int)
-    sign_map[residuals.values > threshold] = 1
-    sign_map[residuals.values < -threshold] = -1
-
-    cmap = ListedColormap(["#fcb6b6", "white", "#b6fcb6"])
-
-    n_rows, n_cols = frequencies.shape
-
-    fig_width = max(4, n_cols * 0.9)
-    fig_height = max(3, n_rows * 0.6)
-
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-
-    im = ax.imshow(sign_map, cmap=cmap, vmin=-1, vmax=1, aspect="auto")
-
-    ax.set_xticks(np.arange(n_cols))
-    ax.set_yticks(np.arange(n_rows))
-    ax.set_xticklabels(col_labels, rotation=45, ha="right")
-    ax.set_yticklabels(row_labels)
-
-    # Annotation des fréquences
-    for i in range(n_rows):
-        for j in range(n_cols):
-            val = frequencies.iat[i, j]
-            ax.text(
-                j, i,
-                f"{val:.1f}",
-                ha="center",
-                va="center",
-                fontsize=8,
-                color="black"
-            )
-
-    if title:
-        ax.set_title(title)
-
-    fig.tight_layout()
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
-
-
 def heatmap_to_base64(heatmap_png):
     """Convertit un heatmap PNG en base64 pour HTML"""
     if heatmap_png is None:
@@ -740,18 +604,20 @@ def dataframe_to_html(df):
 
 def run():
     # initialiser les variables
-    mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
+    pipeline_mode = _in_pipeline_mode()
+    mode = "automatique" if pipeline_mode else st.session_state.get(MODE_KEY, "automatique")
     pipeline_silent = bool(st.session_state.get("__PIPELINE_SILENT__", False))
-    run_sankey_crosstabs = bool(
-        st.session_state.get("run_sankey_crosstabs", not pipeline_silent)
-    )
-    if pipeline_silent:
-        run_sankey_crosstabs = False
+    st.session_state["diagram_sankey_exit_debug"] = {"status": "started", "reason": ""}
+    # Les tris croisés détaillés ne doivent jamais être lancés par défaut
+    # depuis DiagramSankey. Ils sont déclenchés explicitement par DiagnosticGlobal
+    # ou à la demande via QA/CrosstabsDetail.
+    run_sankey_crosstabs = bool(st.session_state.get("run_sankey_crosstabs", False))
     if "etape23_terminee" not in st.session_state:
         st.session_state["etape23_terminee"] = False
 
     if "crosstabs_interpretation" not in st.session_state:
         st.session_state["crosstabs_interpretation"] = None
+    st.session_state.setdefault("sankey_drawn_links_df", pd.DataFrame())
         
     if "sankey_diagram" not in st.session_state:
         st.session_state["sankey_diagram"] = None
@@ -768,7 +634,7 @@ def run():
     st.header("Schéma des relations entre variables")
     
     # Bouton de réinitialisation
-    if "sankey_diagram_generated" in st.session_state:
+    if (not pipeline_mode) and "sankey_diagram_generated" in st.session_state:
         if st.button("Réinitialiser le module Sankey"):
             keys_to_reset = [
                 "profiles",
@@ -784,6 +650,7 @@ def run():
                 "primary_vars_global",
                 "links_sorted_with_flag",
                 "sankey_pair_results",
+                "sankey_drawn_links_df",
                 "sankey_diagram",
                 "crosstabs_interpretation",
                 "links_editor",
@@ -809,33 +676,27 @@ def run():
         return
 
     # -------------------------
-    # Discrétisation des variables continues
+    # Discrétisation centralisée des variables continues
     # -------------------------
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    distinct_threshold_continuous = int(st.session_state.get("distinct_threshold_continuous", 5))
+    mod_freq_min = float(st.session_state.get("mod_freq_min", 0.90))
+    num_quantiles = int(st.session_state.get("num_quantiles", 5))
 
-    if numeric_cols:
-        n_bins = st.slider(
-            "Nombre de classes pour discrétiser les variables continues",
-            min_value=2,
-            max_value=15,
-            value=5,
-        )
+    df_cat, discretization_info = discretize_continuous_variables(
+        df,
+        num_quantiles=num_quantiles,
+        mod_freq_min=mod_freq_min,
+        distinct_threshold_continuous=distinct_threshold_continuous,
+        context_name="apps/DiagramSankey.py",
+    )
+    st.session_state["diagram_sankey_discretization_info"] = discretization_info
 
-        df_discrete = df.copy()
-        for col in numeric_cols:
-            df_discrete[col] = pd.cut(
-                df[col],
-                bins=n_bins,
-                duplicates="drop",
-                include_lowest=True
-            )
-    else:
-        df_discrete = df.copy()
+    if discretization_info.get("errors"):
+        st.error("\n".join(discretization_info["errors"]))
+        return
 
-    # Tout en string pour traiter comme catégoriel
-    df_cat = df_discrete.copy()
-    for col in df_cat.columns:
-        df_cat[col] = df_cat[col].astype(str)
+    if discretization_info.get("warnings"):
+        st.warning("\n".join(discretization_info["warnings"]))
 
     all_vars = list(df_cat.columns)
 
@@ -861,6 +722,13 @@ def run():
         profiles = [p for p in profiles if p != brief_tv]
         st.session_state["profiles"] = profiles
 
+    profiles = st.multiselect(
+        "Variables de profil (niveau 0)",
+        options=all_vars,
+        key="profiles",
+        help="Variables sociodemographiques, de foyer, etc."
+    )
+
     # Une seule variable cible: la plus pertinente (1re de target_variables issue de DiagnosticGlobal).
     # Priorité à la cible du brief si disponible
     if brief_tv and brief_tv in all_vars and brief_tv not in profiles:
@@ -881,11 +749,24 @@ def run():
         st.warning("Aucune variable cible disponible pour DiagramSankey.")
 
     candidates_default = [v for v in all_vars if v not in profiles + outcomes]
+    if pipeline_mode:
+        if not profiles:
+            profiles = _fallback_profiles(all_vars, outcomes)
+            st.session_state["profiles"] = profiles
+        candidates = list(candidates_default)
+    else:
+        candidates = st.multiselect(
+            "Variables candidates médiatrices",
+            options=all_vars,
+            default=candidates_default,
+            help="Variables susceptibles de jouer un rôle intermédiaire (usages, attitudes, etc.)."
+        )
+
     candidates = st.multiselect(
-        "Variables candidates médiatrices",
+        "Variables candidates mÃ©diatrices",
         options=all_vars,
         default=candidates_default,
-        help="Variables susceptibles de jouer un rôle intermédiaire (usages, attitudes, etc.)."
+        help="Variables susceptibles de jouer un rÃ´le intermÃ©diaire (usages, attitudes, etc.)."
     )
 
     if "levels" not in st.session_state:
@@ -894,9 +775,20 @@ def run():
         st.session_state["sankey_pair_results"] = {}
 
     st.subheader("Paramètres statistiques")
-    alpha = st.slider("Seuil de significativité (alpha)", 0.001, 0.1, 0.1, 0.001)
-    v_min = st.slider("Seuil minimum de V de Cramér pour garder un lien", 0.0, 0.4, 0.1, 0.01)
+    if pipeline_mode:
+        alpha = float(st.session_state.get("sankey_alpha", 0.1))
+        v_min = float(st.session_state.get("sankey_v_min", 0.1))
+        max_length_links = int(st.session_state.get("sankey_max_length_links", 1500))
+    else:
+        alpha = st.slider("Seuil de significativité (alpha)", 0.001, 0.1, 0.1, 0.001)
+        v_min = st.slider("Seuil minimum de V de Cramér pour garder un lien", 0.0, 0.4, 0.1, 0.01)
+        max_length_links = st.slider("Nombre maximum de couples de variables", 20, 3000, 1500, 10)
+    alpha = st.slider("Seuil de significativitÃ© (alpha)", 0.001, 0.1, 0.1, 0.001)
+    v_min = st.slider("Seuil minimum de V de CramÃ©r pour garder un lien", 0.0, 0.4, 0.1, 0.01)
     max_length_links = st.slider("Nombre maximum de couples de variables", 20, 3000, 1500, 10)
+    st.session_state["sankey_alpha"] = float(alpha)
+    st.session_state["sankey_v_min"] = float(v_min)
+    st.session_state["sankey_max_length_links"] = int(max_length_links)
 
     if not profiles or not outcomes:
         st.warning("Veuillez sélectionner au moins une variable de profil et une variable d'outcome.")
@@ -933,7 +825,15 @@ def run():
 
         if links_df.empty:
             st.error("Aucun lien significatif trouvé avec ces paramètres.")
+            st.session_state["diagram_sankey_exit_debug"] = {
+                "status": "stopped",
+                "reason": "no_significant_links",
+                "profiles": list(profiles or []),
+                "outcomes": list(outcomes or []),
+                "n_links_initial": 0,
+            }
             st.session_state["relevant_links"] = None
+            st.session_state["sankey_drawn_links_df"] = pd.DataFrame()
             st.session_state["levels"] = None
             st.session_state["etape23_terminee"] = True
             return
@@ -959,7 +859,16 @@ def run():
                     f"Trop de liens significatifs ({len(links_df)}) avec des paramètres standards. "
                     "Veuillez augmenter les seuils de filtrage (alpha et V min)."
                 )
+                st.session_state["diagram_sankey_exit_debug"] = {
+                    "status": "stopped",
+                    "reason": "too_many_links_after_refilter",
+                    "profiles": list(profiles or []),
+                    "outcomes": list(outcomes or []),
+                    "n_links_refiltered": int(len(links_df)),
+                    "max_length_links": int(max_length_links),
+                }
                 st.session_state["relevant_links"] = None
+                st.session_state["sankey_drawn_links_df"] = pd.DataFrame()
                 st.session_state["levels"] = None
                 st.session_state["etape23_terminee"] = True
                 return
@@ -1064,25 +973,48 @@ def run():
             links_df_llm["var_x"].isin(all_nodes)
             & links_df_llm["var_y"].isin(all_nodes)
         ].reset_index(drop=True)
+        drawn_links_df = pd.DataFrame(extract_drawn_links(relevant_links, levels))
+        if drawn_links_df.empty and profiles and outcomes:
+            fallback_levels = [profiles, outcomes]
+            fallback_links = links_df_llm[
+                links_df_llm["var_x"].isin(set(profiles + outcomes))
+                & links_df_llm["var_y"].isin(set(profiles + outcomes))
+            ].reset_index(drop=True)
+            fallback_drawn = pd.DataFrame(extract_drawn_links(fallback_links, fallback_levels))
+            if not fallback_drawn.empty:
+                levels = fallback_levels
+                relevant_links = fallback_links
+                drawn_links_df = fallback_drawn
 
         st.session_state["relevant_links"] = relevant_links
+        st.session_state["sankey_drawn_links_df"] = drawn_links_df
+        st.session_state["diagram_sankey_exit_debug"] = {
+            "status": "running",
+            "reason": "links_retained_after_leveling",
+            "profiles": list(profiles or []),
+            "outcomes": list(outcomes or []),
+            "n_links_initial": int(len(links_df)),
+            "n_relevant_links": int(len(relevant_links)),
+            "n_drawn_links": int(len(drawn_links_df)),
+        }
         st.session_state["links_sorted_with_flag"] = None
         st.session_state["sankey_pair_results"] = {}
         st.session_state["crosstabs_interpretation"] = None
         if not str(st.session_state.get("latent_summary_text", "")).strip():
             st.session_state["latent_summary_text"] = (
                 f"Schema Sankey calcule avec {len(profiles)} variable(s) de profil, "
-                f"{len(outcomes)} variable(s) cible(s) et {len(relevant_links)} lien(s) retenu(s)."
+                f"{len(outcomes)} variable(s) cible(s) et {len(drawn_links_df)} lien(s) retenu(s)."
             )
 
         st.success(f"{len(links_df)} liens significatifs avant filtrage par latents / niveaux.")
-        st.success(f"{len(relevant_links)} liens pertinents conservés (Sankey + tris croisés).")
+        st.success(f"{len(drawn_links_df)} liens effectivement dessinés et conservés (Sankey + tris croisés).")
 
 
     # -----------------------------
     # TABLEAU + DIAGRAMME SANKEY + INTERPRETATION LLM DES TRIS CROISES
     # -----------------------------
     relevant_links = st.session_state.get("relevant_links")
+    drawn_links_df = st.session_state.get("sankey_drawn_links_df")
     levels = st.session_state.get("levels")
     latent_info = st.session_state.get("latent_info")
 
@@ -1102,11 +1034,12 @@ def run():
     else:
         var_to_latent, _englobing_vars = {}, set()
 
-    links_sorted = (
-        relevant_links
-        .sort_values("v", ascending=False)
-        .reset_index(drop=True)
-    )
+    if not isinstance(drawn_links_df, pd.DataFrame) or drawn_links_df.empty:
+        st.info("Aucun lien effectivement dessiné dans le diagramme de Sankey.")
+        st.session_state["etape23_terminee"] = True
+        return
+
+    links_sorted = drawn_links_df.sort_values("v", ascending=False).reset_index(drop=True)
 
     # Pré-sélection des couples
     preselected_ids = set()
@@ -1185,110 +1118,15 @@ def run():
     if st.session_state.get("sankey_diagram_generated"):
         st.success("sankey diagram generated")
 
-    # 4) Lancer l'analyse LLM des couples sélectionnés
-    
-    # Execution pilotee par le pipeline global (pas de gating local manuel/auto)
-    proceed2 = True
-    if proceed2:
-        if not run_sankey_crosstabs:
-            st.session_state["crosstabs_interpretation"] = []
-            st.session_state["sankey_pair_results"] = {}
-            st.session_state["crosstabs_generated"] = False
-            if not pipeline_silent:
-                st.info("Analyse des tris croises desactivee (mode rapide).")
-        else:
-            edited_links = st.session_state["links_sorted_with_flag"]
-            # On selectionne uniquement les lignes ou la checkbox "Analyser LLM" est vraie
-            links_for_llm = edited_links[edited_links["Analyser LLM"]]
-
-            # Plafond du nombre de couples envoyes au LLM pour maitriser le temps/coût
-            top_n_llm = int(st.session_state.get("sankey_top_n_llm_pairs", 10))
-            if len(links_for_llm) > top_n_llm:
-                links_for_llm = (
-                    links_for_llm
-                    .sort_values(by="v", ascending=False)
-                    .head(top_n_llm)
-                    .reset_index(drop=True)
-                )
-                if not pipeline_silent:
-                    st.info(f"Limitation aux {top_n_llm} couples avec le V de Cramer le plus eleve pour l'analyse LLM.")
-
-            st.subheader("Analyse des tris croises")
-
-            crosstabs_interpretation = []
-            results_store = st.session_state.get("sankey_pair_results", {})
-
-            if links_for_llm.empty:
-                st.info("Aucun couple selectionne pour l'analyse LLM.")
-                st.session_state["crosstabs_generated"] = False
-            else:
-                for _, row in links_for_llm.iterrows():
-                    var_x = row["var_x"]
-                    var_y = row["var_y"]
-                    v_val = row["v"]
-                    p_val = row["p"]
-                    chi2_val = row["chi2"]
-                    pair_id = int(row["pair_id"])
-
-                    if pair_id in results_store:
-                        res = results_store[pair_id]
-                        ct_count = res["ct_count"]
-                        ct_pct_row = res["ct_pct_row"]
-                        std_res = res["std_res"]
-                        interpretation = res["interpretation"]
-                        heatmap_png = res["heatmap_png"]
-                    else:
-                        ct_count, ct_pct_row, std_res = crosstab_with_std_residuals(df_cat, var_x, var_y)
-                        if ct_pct_row is None or std_res is None:
-                            st.info("Tableau de contingence vide ou non exploitable.")
-                            continue
-
-                        with st.spinner(f"Interpretation LLM pour {var_x} x {var_y}..."):
-                            base_interpretation = interpret_crosstab_with_llm(
-                                var_x, var_y, ct_pct_row, std_res
-                            )
-
-                        metrics_header = (
-                            f"V de Cramer = {v_val:.3f} ; "
-                            f"p-value = {p_val:.5f} ; "
-                            f"Khi2 = {chi2_val:.3f}\n\n"
-                        )
-                        interpretation = metrics_header + base_interpretation
-
-                        frequencies = ct_pct_row.round(2)
-
-                        heatmap_png = crosstab_heatmap_png(
-                            frequencies,
-                            std_res,
-                            threshold=2.0,
-                            title=f"{var_x} x {var_y}"
-                        )
-
-                        results_store[pair_id] = {
-                            "var_x": var_x,
-                            "var_y": var_y,
-                            "v": v_val,
-                            "p": p_val,
-                            "chi2": chi2_val,
-                            "ct_count": ct_count,
-                            "ct_pct_row": ct_pct_row,
-                            "std_res": std_res,
-                            "interpretation": interpretation,
-                            "heatmap_png": heatmap_png,
-                        }
-
-                    crosstabs_interpretation.append({
-                        "pair_id": pair_id,
-                        "var_x": var_x,
-                        "var_y": var_y,
-                        "interpretation": interpretation,
-                    })
-
-                st.session_state["crosstabs_interpretation"] = crosstabs_interpretation
-                st.session_state["sankey_pair_results"] = results_store
-                st.session_state["crosstabs_generated"] = True
-    if st.session_state.get("crosstabs_generated"):
-        st.success("Crosstabs + interpretations generated")
+    # 4) Les tris croisés détaillés sont désormais gérés par CrosstabsDetail.
+    # Sankey ne conserve qu'un nettoyage minimal pour éviter d'afficher des artefacts périmés.
+    if not run_sankey_crosstabs:
+        st.session_state["crosstabs_interpretation"] = []
+        st.session_state["sankey_pair_results"] = {}
+        st.session_state["sankey_drawn_links_df"] = pd.DataFrame()
+        st.session_state["crosstabs_generated"] = False
+        if not pipeline_silent:
+            st.info("Analyse des tris croises desactivee (mode rapide).")
 
 
     # 5) Interprétation du diagramme de Sankey

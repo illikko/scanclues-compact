@@ -7,6 +7,9 @@ import streamlit as st
 from openai import OpenAI
 from scipy.stats import chi2_contingency
 
+from core.preparation_details import refresh_preparation_details_payload
+from core.preparation_diagnostics import remove_preparation_diagnostic, set_preparation_diagnostic
+
 # ============================================================
 # App de détection de questions conditionnelles
 # autres définition pour conditionnelles : avec valeurs manquantes structurelles, skip patterns
@@ -117,6 +120,58 @@ def build_columns_infos(
         })
 
     return pd.DataFrame(rows)
+
+
+def diagnose_structural_missing_candidates(
+    df: pd.DataFrame,
+    *,
+    max_modalities: int = 10,
+    cat_unique_threshold: int = 30,
+    min_missing_rate: float = 0.05,
+) -> dict:
+    columns_infos = build_columns_infos(
+        df,
+        max_modalities=max_modalities,
+        cat_unique_threshold=cat_unique_threshold,
+    )
+    candidates = columns_infos[
+        columns_infos["question_id"].notna()
+        & (columns_infos["missing_rate"] >= float(min_missing_rate))
+    ].copy()
+
+    grouped = []
+    if not candidates.empty:
+        for qid, grp in candidates.groupby("question_id"):
+            block_cols = grp["column"].astype(str).tolist()
+            if len(block_cols) < 2:
+                continue
+            grouped.append(
+                {
+                    "question_id": str(qid),
+                    "columns": block_cols,
+                    "avg_missing_rate": float(grp["missing_rate"].mean()),
+                }
+            )
+
+    diagnostic = {
+        "id": "structural_missing",
+        "label": "Identifier les manquantes structurelles",
+        "needed": bool(grouped),
+        "reason": (
+            f"{len(grouped)} bloc(s) de questions avec manquants conditionnels potentiels"
+            if grouped
+            else "Aucun bloc de manquants structurels plausible détecté"
+        ),
+        "details": {
+            "groups": grouped,
+            "min_missing_rate": float(min_missing_rate),
+        },
+        "compute_module": "ManquantesStructurelles",
+        "render_module": "ManquantesStructurelles",
+        "available": True,
+    }
+    set_preparation_diagnostic(diagnostic)
+    return diagnostic
 
 
 def columns_infos_to_payload(columns_infos: pd.DataFrame) -> list[dict]:
@@ -680,9 +735,13 @@ def run():
         df = st.session_state.df_ex_multiples
     else:
         st.warning("Aucun dataset trouvé. Veuillez d'abord passer par l'application précédente.")
+        remove_preparation_diagnostic("structural_missing")
+        st.stop()
 
     st.success("Fichier chargé.")
     st.dataframe(df.head(), use_container_width=True)
+    diagnose_structural_missing_candidates(df)
+    refresh_preparation_details_payload()
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -757,6 +816,7 @@ def run():
             st.info("Aucun candidat détecté avec les seuils actuels. Essayez de baisser v_min ou tau_high, ou min_support.")
             st.session_state.df_imputed_structural = df
             st.session_state["etape7_terminee"] = True
+            refresh_preparation_details_payload()
             return
             
         else:
@@ -837,7 +897,7 @@ def run():
     st.markdown("### Tableau complet des variables avec les règles")                        
     st.dataframe(st.session_state["columns_infos_enriched"])                
 
-    st.subheader("5) Aide à lâ€™interprétation des métriques")
+    st.subheader("5) Aide à l'interprétation des métriques")
     st.markdown(
         """
     - **trigger_values** (valeurs déclencheuses) : modalités du parent pour lesquelles lâ€™enfant est *presque toujours manquant*  
@@ -923,8 +983,7 @@ def run():
             st.markdown("### Aperçu du dataset imputé")
             st.dataframe(df_imputed.head(), use_container_width=True)
             st.session_state["etape7_terminee"] = True
+            refresh_preparation_details_payload()
             
             csv = df_imputed.to_csv(index=False, sep=';', encoding='utf-8')
             st.download_button("Télécharger le dataset", csv, "df_imputed.csv", "text/csv")
-
-

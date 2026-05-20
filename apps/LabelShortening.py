@@ -4,6 +4,8 @@ from openai import OpenAI
 import os
 import json, re
 from core.df_registry import DFState, get_df, set_df
+from core.preparation_details import refresh_preparation_details_payload
+from core.preparation_diagnostics import set_preparation_diagnostic
 from utils import preparation_process
 from collections import Counter
 
@@ -124,6 +126,29 @@ def shorten_column_names(columns_to_shorten, max_chars: int, model: str = "gpt-4
 
     return corrected_labels
 
+
+def diagnose_long_labels(df: pd.DataFrame, max_chars: int = 50) -> dict:
+    columns_to_shorten = [str(col) for col in df.columns.tolist() if len(str(col)) > int(max_chars)]
+    diagnostic = {
+        "id": "long_labels",
+        "label": "Raccourcir les libellés trop longs",
+        "needed": bool(columns_to_shorten),
+        "reason": (
+            f"{len(columns_to_shorten)} colonne(s) dépassent {int(max_chars)} caractères"
+            if columns_to_shorten
+            else "Aucun libellé trop long détecté"
+        ),
+        "details": {
+            "max_chars": int(max_chars),
+            "columns": columns_to_shorten,
+        },
+        "compute_module": "LabelShortening",
+        "render_module": "LabelShortening",
+        "available": True,
+    }
+    set_preparation_diagnostic(diagnostic)
+    return diagnostic
+
 # App Streamlit
 
 def run():
@@ -144,6 +169,7 @@ def run():
 
     # 2- Choix du nombre maximum de caractères
     max_chars = st.slider("Nombre max. de caractères pour les noms de colonnes", min_value=5, max_value=120, value=50)
+    diagnose_long_labels(df, max_chars=max_chars)
 
     # 3- Filtrer les noms trop longs
     original_columns = df.columns.tolist()
@@ -236,6 +262,7 @@ def run():
 
     st.session_state.shortened_labels_mapping = edited_df
     st.dataframe(st.session_state.shortened_labels_mapping)
+    refresh_preparation_details_payload()
 
     if proceed:
         try:
@@ -260,9 +287,7 @@ def run():
                         
             st.write("Vous pouvez lancer la prochaine étape dans le menu à gauche: Préparation 2.")
             st.session_state["etape4_terminee"] = True
+            refresh_preparation_details_payload()
             
         except Exception as e:
             st.error(f"Erreur lors de l’application des nouveaux noms : {e}")
-
-
-

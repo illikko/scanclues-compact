@@ -18,6 +18,10 @@ api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
 MODE_KEY = "__NAV_MODE__"
 
 
+def _in_pipeline_mode() -> bool:
+    return bool(st.session_state.get("__PIPELINE_FORCE_AUTO__", False))
+
+
 # ======================
 # Fonctions statistiques
 # ======================
@@ -70,10 +74,28 @@ def _pick_dataset():
     return datasets_disponibles
 
 
+def _select_dataset(datasets_disponibles: dict[str, pd.DataFrame]) -> tuple[str, pd.DataFrame]:
+    preferred_labels = [
+        "Variables actives, ordinales encodÃƒÂ©es",
+        "Toutes les variables, ordinales encodÃƒÂ©es",
+        "Toutes les variables",
+    ]
+    if _in_pipeline_mode():
+        for label in preferred_labels:
+            if label in datasets_disponibles:
+                return label, datasets_disponibles[label].copy()
+        first_label = next(iter(datasets_disponibles))
+        return first_label, datasets_disponibles[first_label].copy()
+
+    choix = st.selectbox("Choisissez un dataset ÃƒÂ  utiliser :", list(datasets_disponibles.keys()), index=0)
+    return choix, datasets_disponibles[choix].copy()
+
+
 # ======================
 # Application Streamlit
 # ======================
 def run():
+    pipeline_mode = _in_pipeline_mode()
 
     # drapeau d'étape
     st.session_state.setdefault("etape21_terminee", False)
@@ -93,8 +115,7 @@ def run():
         st.stop()
 
     # Sélection dataset
-    choix = st.selectbox("Choisissez un dataset à utiliser :", list(datasets_disponibles.keys()), index=0)
-    df = datasets_disponibles[choix].copy()
+    choix, df = _select_dataset(datasets_disponibles)
 
     # Paramètres mutualisés (utils.ensure_analysis_params)
     num_bins = int(st.session_state.get("num_quantiles", 5))
@@ -125,7 +146,10 @@ def run():
     candidates = st.session_state.get("target_variables", [])
     preferred = candidates[0] if candidates else (options[0] if options else None)
     default_index = options.index(preferred) if (preferred in options) else 0 if options else None
-    if options:
+    if options and pipeline_mode:
+        target_variable = preferred
+        st.session_state["correlation_display_target"] = target_variable
+    elif options:
         target_variable = st.selectbox(
             "Variable cible (stockée pour usage agentique éventuel) :",
             options,
@@ -136,13 +160,21 @@ def run():
         target_variable = None
 
     # Construction d'un sous-ensemble pour le dendrogramme (aucune heatmap affichée)
-    max_vars = st.slider(
-        "Nombre maximum de variables dans le dendrogramme :",
-        min_value=10,
-        max_value=min(50, len(corr_matrix.columns)),
-        value=min(35, len(corr_matrix.columns)),
-        step=5,
-    )
+    max_vars_upper = min(50, len(corr_matrix.columns))
+    max_vars_default = min(int(st.session_state.get("correlation_max_vars", 35)), len(corr_matrix.columns))
+    if max_vars_upper < 10:
+        max_vars = max_vars_upper
+    elif pipeline_mode:
+        max_vars = max(10, max_vars_default)
+    else:
+        max_vars = st.slider(
+            "Nombre maximum de variables dans le dendrogramme :",
+            min_value=10,
+            max_value=max_vars_upper,
+            value=max(10, max_vars_default),
+            step=5,
+        )
+    st.session_state["correlation_max_vars"] = max_vars
 
     corr_pairs = (
         corr_matrix.abs()

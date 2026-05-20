@@ -2,6 +2,7 @@
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from core.df_registry import DFState, get_df, set_df
+from core.preparation_details import refresh_preparation_details_payload
 from utils import preparation_process
 
 MODE_KEY = "__NAV_MODE__"
@@ -160,7 +161,7 @@ def run():
 
         st.write("Vous pouvez lancer la prochaine étape dans le menu à gauche : Analyse des corrélations.")
         st.session_state["etape13_terminee"] = True
-
+        refresh_preparation_details_payload()
 
 
 

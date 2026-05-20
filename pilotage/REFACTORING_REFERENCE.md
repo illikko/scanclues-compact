@@ -1,221 +1,319 @@
-﻿# Référence de refactorisation (iso-fonctionnalité) - `app_survey`
+# Référence de refonte / architecture - `app_survey`
 
-## 1) Objectif
+## 1. Objectif
 
-Restructurer l'application Streamlit sans changer les résultats métier dans un premier temps:
-- stabiliser l'exécution (reruns Streamlit)
-- clarifier le pipeline de données
-- séparer calcul et affichage
-- préparer une UX simplifiée en 3 écrans (upload -> diagnostic -> rapport final)
+Cette note décrit l’architecture cible et l’état actuel de la refonte de `app_survey`.
 
----
+Objectifs de la refonte :
+- stabiliser l’exécution Streamlit malgré les reruns ;
+- séparer autant que possible calcul, orchestration et rendu ;
+- centraliser les sorties consolidées dans `RapportFinal` ;
+- rendre le module Q&A réellement agentique, réutilisable et extensible ;
+- réduire la logique UI historique devenue inutile.
 
-## 2) Stack technique et versions (état observé)
-
-### Runtime
-- Python: environnement d'exécution pointé par `MainApp.bat` = `clean_py310` (Python 3.10 présumé)
-- Indice complémentaire: présence de `__pycache__` en `cpython-310`
-- Attention: un autre dossier du workspace (`app/`) contient un `runtime.txt` en `python-3.11.9` (incohérence à corriger)
-
-### Librairies utilisées dans `app_survey`
-- streamlit
-- pandas
-- numpy
-- scikit-learn
-- scipy
-- matplotlib
-- seaborn
-- missingno
-- kmodes
-- prince
-- plotly
-- openai
-- openpyxl
-- pillow
-
-### Constat
-- Les versions ne sont pas figées (reproductibilité faible).
+Cette note ne remplace pas `Agents.md` :
+- `Agents.md` fixe les règles de contribution ;
+- ce document décrit l’architecture effective, les contrats et les chantiers restants.
 
 ---
 
-## 3) Carte du repo (`app_survey`)
+## 2. Vue d’ensemble de l’application
 
-- `MainApp.py`: orchestrateur navigation/étapes
-- `auth.py`: contrôle d'accès (code d'invitation)
-- `utils.py`: utilitaires transverses (process prep, discrétisation, paramètres)
-- `apps/`: modules d'analyse (préparation, diagnostics, segmentation, rapport final, QA)
-- `apps/_report.py`: collecte/génération des blocs du rapport
-- `.streamlit/config.toml.toml`: config Streamlit (nom de fichier à corriger)
+Pipeline utilisateur principal :
+1. `Download`
+2. `DiagnosticGlobal`
+3. `RapportFinal`
+4. `QA`
 
-Remarques:
-- état applicatif très dense dans `st.session_state` (beaucoup de clés hétérogènes)
-
----
-
-## 4) Commandes standards (cible)
-
-Depuis `app_survey`:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run MainApp.py
-```
-
-Tests/lint (cible):
-
-```powershell
-pytest -q
-ruff check .
-black --check .
-```
+Principe :
+- les modules produisent des données, synthèses, tableaux et figures dans `st.session_state` ;
+- `PipelineRunner` orchestre l’exécution silencieuse ;
+- `RapportFinal` est le point principal de restitution ;
+- `QA` réutilise les mêmes artefacts et peut déclencher des analyses complémentaires.
 
 ---
 
-## 5) Stratégie de test (avant/après refacto)
+## 3. Composants structurants
 
-## Objectif de non-régression
-- à dataset identique, mêmes sorties clés (tables, tailles, colonnes, valeurs agrégées principales)
-- même capacité à produire le `RapportFinal` et le zip d'export
+### 3.1 Navigation et orchestration
 
-## Niveaux de tests
-- Unitaires: fonctions pures extraites des modules (`apps/*`)
-- Intégration: pipeline de transformation des DataFrames (de `df_raw` à `df_ready`/`df_encoded`)
-- Golden tests: snapshots de sorties tabulaires (CSV de référence)
-- Smoke tests UI: enchaînement minimal (upload -> exécution bloc -> rapport)
+- [MainApp.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/MainApp.py)
+  - navigation générale ;
+  - ordre des étapes ;
+  - affichage du module actif.
 
-## Jeux de données
-- un mini dataset synthétique (rapide)
-- un dataset réel anonymisé (validation métier)
+- [apps/PipelineRunner.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/PipelineRunner.py)
+  - exécution silencieuse du pipeline standard ;
+  - journalisation via `pipeline_execution_logs` ;
+  - statut global du pipeline ;
+  - séquencement des modules systématiques et conditionnels.
 
----
+### 3.2 Cadrage et contexte d’analyse
 
-## 6) Règles style/lint (cible)
+- [apps/DiagnosticGlobal.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/DiagnosticGlobal.py)
+  - écran de cadrage métier ;
+  - choix des options utilisateur ;
+  - alimentation du contexte d’analyse.
 
-- formattage automatique: `black`
-- lint: `ruff`
-- typage progressif: annotations sur fonctions de transformation
-- principe: pas d'effet de bord caché dans les fonctions métier
-- séparation stricte:
-  - `compute_*`: calcul uniquement
-  - `render_*`: affichage Streamlit uniquement
+- [core/analysis_context_resolver.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/core/analysis_context_resolver.py)
+  - normalisation des options ;
+  - résolution du contexte minimal partagé entre pipeline et QA.
 
----
+- [core/analysis_capabilities.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/core/analysis_capabilities.py)
+  - registre des capacités analytiques ;
+  - description des actions disponibles ;
+  - aide à la planification agentique.
 
-## 7) Zones "ne pas toucher" (phase iso-fonctionnalité)
+### 3.3 Restitution standard
 
-- logique d'authentification (`auth.py`) sauf encapsulation mineure
-- prompts LLM métier existants (contenu) tant que la validation métier n'a pas été faite
-- format des exports attendus par les utilisateurs finaux (`df_ready.csv`, etc.)
-- clés de session existantes utilisées en production (on ajoute des alias avant suppression)
+- [apps/RapportFinal.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/RapportFinal.py)
+  - restitution consolidée ;
+  - affichage des synthèses, graphiques, tableaux et logs ;
+  - affichage des détails de préparation quand l’option est activée.
 
----
+- [core/report_export.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/core/report_export.py)
+  - export HTML ;
+  - construction des sections d’export à partir de `session_state`.
 
-## 8) Notes sécurité
+### 3.4 Q&A agentique
 
-- clé API OpenAI: uniquement via variable d'environnement ou `st.secrets`, jamais en dur
-- aucune donnée sensible dans logs/erreurs Streamlit
-- limiter les aperçus envoyés au LLM (déjà partiellement fait avec `head(10)`)
-- ajouter une politique explicite de masquage/anonymisation avant appel LLM (phase 2)
-- vérifier les exports HTML (éviter injection via champs texte non échappés)
+- [apps/QA.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/QA.py)
+  - planification des actions QA ;
+  - rendu conversationnel ;
+  - exécution de capacités complémentaires ;
+  - relances et mémoire de conversation.
 
----
+- [core/qa_memory.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/core/qa_memory.py)
+  - historique Q&A ;
+  - résumé conversationnel ;
+  - relances proposées.
 
-## 9) Plan de refactorisation proposé
-
-## Phase 1 - Compléter les fichiers manquants du repo
-
-Créer dans `app_survey`:
-- `README.md`: usage, pipeline, architecture
-- `requirements.txt`: versions figées
-- `runtime.txt`: version Python cible (alignée env réel)
-- `.gitignore`: `__pycache__`, `.venv`, `.streamlit/secrets.toml`, exports
-- `pyproject.toml`: config `black`, `ruff`, `pytest`
-- `tests/`:
-  - `tests/test_pipeline_smoke.py`
-  - `tests/test_df_registry.py` (après phase 2)
-- `docs/STATE_KEYS.md`: inventaire et statut des clés `st.session_state`
-- `docs/REFactoring_DECISIONS.md`: ADR légères (décisions techniques)
-
-Critère de sortie phase 1:
-- repo installable/rejouable sur une machine propre
-- conventions de dev et de test écrites
-
-## Phase 2 - Gérer les différents noms de DataFrame
-
-Problème actuel:
-- coexistence de nombreuses clés (`df_raw`, `df_ex_verbatim`, `df_shortlabels`, `df_ex_ordonnees`, `df_ready`, `df_encoded`, `df_active`, etc.)
-- risque élevé d'erreurs de branchement entre modules
-
-Solution proposée: registre central + alias de transition
-
-1. Ajouter `app_survey/core/df_registry.py`
-- enum des états canoniques:
-  - `RAW`, `VERBATIM_READY`, `SHORT_LABELS`, `MULTI_ORD_DONE`, `MULTI_DONE`, `IMPUTED`, `READY`, `ENCODED`, `ACTIVE`, `ILLUSTRATIVE`
-- API:
-  - `set_df(state, df)`
-  - `get_df(state, required=True)`
-  - `set_alias(old_key, state)`
-
-2. Migration progressive
-- chaque module lit/écrit via le registry
-- compatibilité maintenue via mapping alias -> anciennes clés session
-- suppression des alias uniquement après validation non-régression
-
-3. Traçabilité
-- journal de transformations minimal (`from_state`, `to_state`, `rows`, `cols`, `step_name`)
-
-Critère de sortie phase 2:
-- un chemin de données unique et explicite
-- disparition des accès directs aux clés `df_*` dans les modules métier
-
-## Phase 3 - Simplifier l'UX (upload -> diagnostic -> résultats finaux)
-
-Cible UX:
-- écran A: Upload
-- écran B: Diagnostic + choix utilisateur (4 boutons)
-  - `PD`: préparation dataset
-  - `PD + S`
-  - `PD + AD + S`
-  - `TOUT`
-- écran C: Affichage final consolidé uniquement
-
-Règles d'implémentation:
-1. Conserver les modules (contrainte Streamlit rerun)
-2. Sortir l'affichage intermédiaire des modules
-- modules = fonctions de calcul et stockage résultats uniquement
-- pas de rendu final dans les étapes intermédiaires
-3. Centraliser le rendu dans `RapportFinal` (ou `rapport_final` cible)
-- textes, graphiques, tableaux affichés uniquement en fin
-4. Ajouter un orchestrateur de pipeline
-- exécute conditionnellement les blocs selon le bouton choisi
-- garde l'état d'avancement dans `st.session_state` pour survivre aux reruns
-
-Pattern recommandé par module:
-- `run_compute(state) -> dict` (ou écrit via registry)
-- `collect_report_items(state)` pour alimenter `_report`
-
-Critère de sortie phase 3:
-- aucune visualisation métier affichée avant l'écran final
-- 4 modes utilisateur fonctionnels et iso-résultats
+- [core/segment_context.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/core/segment_context.py)
+  - résolution de segments depuis une question ;
+  - contextualisation d’une catégorie ;
+  - tables effectifs / pourcentages pour un segment.
 
 ---
 
-## 10) Ordre d'exécution recommandé
+## 4. Architecture métier actuelle
 
-1. Phase 1 (fichiers manquants + standardisation environnement)
-2. Phase 2 (registry DataFrame + alias)
-3. Phase 3 (orchestrateur UX + affichage final uniquement)
-4. Nettoyage final (suppression copies, dead code, anciennes clés)
+### 4.1 Préparation des données
+
+Modules principaux :
+- [apps/Download.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/Download.py)
+- [apps/Preparation1.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/Preparation1.py)
+- [apps/Preparation2.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/Preparation2.py)
+- [apps/DiagnosticMissing.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/DiagnosticMissing.py)
+- [apps/Outliers.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/Outliers.py)
+- [apps/ManquantesStructurelles.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/ManquantesStructurelles.py)
+- [apps/LabelShortening.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/LabelShortening.py)
+
+État actuel :
+- les synthèses et les artefacts utiles sont disponibles pour `RapportFinal` ;
+- l’option `Détails de la préparation` existe ;
+- une partie du rendu détaillé reste encore à reprendre proprement ;
+- la présentation de la préparation n’est pas encore au niveau cible.
+
+### 4.2 Modules systématiques du pipeline
+
+- [apps/AnalyseFactorielle.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/AnalyseFactorielle.py)
+- [apps/AnalyseCorrelations.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/AnalyseCorrelations.py)
+- [apps/Segmentation.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/Segmentation.py)
+
+État actuel :
+- fonctionnement piloté par le pipeline silencieux ;
+- dépendance aux widgets réduite dans les cas standards ;
+- sortie encore partiellement couplée à une logique UI historique.
+
+### 4.3 Analyse descriptive conditionnelle
+
+- [apps/DiagramSankey.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/DiagramSankey.py)
+- [apps/CrosstabsDetail.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/CrosstabsDetail.py)
+- [apps/DistributionsDetail.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/DistributionsDetail.py)
+- [apps/DistributionVariables.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/DistributionVariables.py)
+- [apps/Profils_y.py](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/apps/Profils_y.py)
+
+État actuel :
+- Sankey, latents et tris croisés sont de nouveau intégrés au flux standard ;
+- QA peut déclencher des distributions, des profils de segment, des analyses relationnelles et `Profils_y` sur segment ;
+- l’architecture reste encore plus couplée qu’une vraie architecture “compute-first”.
 
 ---
 
-## 11) Risques et parades
+## 5. Contrats inter-modules importants
 
-- Risque: casse due aux reruns Streamlit
-  - Parade: garder les modules, stocker les sorties calculées en session, rerender final seulement
-- Risque: divergence de versions Python/libs
-  - Parade: figer `runtime.txt` + `requirements.txt`
-- Risque: régression fonctionnelle silencieuse
-  - Parade: golden tests + comparaison snapshots avant/après
+### 5.1 Données
+
+- `df_raw`
+- `df_ready`
+- `process`
+
+### 5.2 Cadrage
+
+- `analysis_options`
+- `analysis_context`
+- `target_variables`
+- `illustrative_variables`
+- `target_modalities`
+- `details_preparation_selected`
+
+### 5.3 Pipeline
+
+- `pipeline_ready_to_run`
+- `pipeline_executed`
+- `pipeline_status`
+- `pipeline_execution_logs`
+- `pipeline_execution_seconds`
+- `pipeline_execution_plan`
+- `pipeline_execution_stages`
+
+### 5.4 Restitution standard
+
+- `data_preparation_synthesis`
+- `global_synthesis`
+- `final_report_ready`
+- `final_export_zip_bytes`
+
+### 5.5 Sankey / descriptif
+
+- `sankey_diagram`
+- `sankey_diagram_base64`
+- `sankey_interpretation_synthesis`
+- `sankey_latents`
+- `latent_summary_text`
+- `crosstabs_interpretation`
+- `sankey_pair_results`
+
+### 5.6 Distributions / profils
+
+- `dominant_continues`
+- `dominant_discretes`
+- `profil_dominant_analysis`
+- `figs_variables_distribution`
+- `qa_segment_profile_text`
+- `qa_segment_profils_y_text`
+
+### 5.7 Q&A
+
+- `qa_history`
+- `qa_conversation_summary`
+- `qa_last_followup_question`
+- `qa_last_followup_questions`
+- `qa_relationship_synthesis`
+- `qa_segment_context`
+- `qa_segment_counts_table`
+- `qa_segment_percent_table`
+
+La référence détaillée des clés reste dans :
+- [docs/STATE_KEYS.md](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/docs/STATE_KEYS.md)
+
+---
+
+## 6. Ce qui a déjà été refondu
+
+### 6.1 Côté QA
+
+Déjà en place :
+- mémoire conversationnelle ;
+- relances proposées ;
+- contextualisation de segment ;
+- profil dominant sur sous-population ;
+- `Profils_y` sur segment via cible binaire temporaire ;
+- analyse de relations entre variables ;
+- exploitation du catalogue `analysis_capabilities` par le planificateur.
+
+### 6.2 Côté pipeline
+
+Déjà en place :
+- orchestration plus lisible dans `PipelineRunner` ;
+- journalisation enrichie des modules ;
+- meilleure intégration Sankey / latents / crosstabs ;
+- détails de préparation amorcés ;
+- `RapportFinal` comme point de restitution principal.
+
+---
+
+## 7. Chantiers encore ouverts
+
+### 7.1 Reprise de la préparation des données
+
+À faire :
+- revoir la présentation complète de `Etapes des préparations` ;
+- enrichir proprement `Détails de la préparation` ;
+- mieux distinguer synthèse et détails ;
+- fiabiliser la remontée de certaines étapes amont, dont l’échantillonnage.
+
+### 7.2 Nettoyage UI historique
+
+À poursuivre :
+- retirer les rendus intermédiaires encore inutiles ;
+- supprimer les branches héritées sans utilité métier ;
+- réduire la dépendance aux widgets dans les modules appelés par pipeline et QA.
+
+### 7.3 Durcissement QA
+
+À poursuivre :
+- améliorer encore la qualité des suggestions ;
+- mieux distinguer réponse depuis artefacts existants et recalcul complémentaire ;
+- réduire les heuristiques ad hoc encore présentes dans `QA.py`.
+
+### 7.4 Consolidation encodage
+
+Risque toujours sensible :
+- certains fichiers ont déjà subi du mojibake ;
+- toute modification sur ces zones doit être faite avec une base saine ;
+- ne jamais réintroduire de texte corrompu dans l’UI, les prompts ou les exports.
+
+---
+
+## 8. Règles de modification recommandées
+
+Avant modification :
+1. lire le module ;
+2. lire son orchestrateur ;
+3. lire son consommateur principal.
+
+Exemples :
+- module producteur : `DiagramSankey`
+- orchestrateur : `PipelineRunner`
+- consommateur : `RapportFinal` ou `QA`
+
+Pendant modification :
+- modifier au plus petit périmètre ;
+- préserver les clés `session_state` existantes ;
+- éviter tout patch transverse si un lot fermé suffit ;
+- préférer les sorties explicites aux heuristiques implicites.
+
+Après modification :
+- vérifier le pipeline standard ;
+- vérifier le rapport ;
+- vérifier le Q&A si la clé ou l’artefact est partagé ;
+- vérifier les logs de pipeline ;
+- vérifier l’encodage visible.
+
+---
+
+## 9. Trajectoire cible
+
+Architecture cible à moyen terme :
+- modules métier plus proches de briques “compute-first” ;
+- orchestration standard via `PipelineRunner` ;
+- restitution standard via `RapportFinal` ;
+- orchestration complémentaire via `QA` ;
+- catalogue de capacités central dans `core/analysis_capabilities.py`.
+
+En pratique, cela signifie :
+- moins de mini-apps Streamlit autonomes ;
+- plus de sorties métier explicites ;
+- moins de logique cachée dans les widgets ;
+- plus de cohérence entre pipeline standard et Q&A.
+
+---
+
+## 10. Documents associés
+
+- [Agents.md](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/Agents.md)
+- [docs/STATE_KEYS.md](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/docs/STATE_KEYS.md)
+- [pilotage/PROJECT.md](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/pilotage/PROJECT.md)
+- [pilotage/ACTION_PLAN.md](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/pilotage/ACTION_PLAN.md)
+- [pilotage/TEST_LOG.md](/C:/Users/casta/Documents/scanClues/_Surveys/Appli/AppStreamlit/app_survey/pilotage/TEST_LOG.md)

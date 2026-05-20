@@ -1,71 +1,97 @@
-﻿import streamlit as st
-import pandas as pd
-from openai import OpenAI
+﻿import difflib
 import json
 import os
-import difflib
+from typing import Any
+
+import pandas as pd
+import streamlit as st
+from openai import OpenAI
+
 from apps.CrosstabsDetail import run as run_crosstabs_detail
+from apps.DiagramSankey import run as run_diagram_sankey
+from apps.DistributionVariables import run as run_distribution_variables
 from apps.DistributionsDetail import run as run_distributions_detail
-from core.correlations_utils import discretize_series_quantiles, fill_missing_for_discrete
-from core.crosstab_utils import summarize_crosstab
-from core.reset_state import reset_app_state
-from apps.DiagramSankey import (
-    crosstab_with_std_residuals,
-    crosstab_heatmap_png,
-    interpret_crosstab_with_llm,
+from apps.Preparation1 import run as run_preparation1
+from apps.Preparation2 import run as run_preparation2
+from apps.Profils_y import run as run_profils_y
+from core.brief_agent import get_analysis_capability_catalog, run_brief_agent
+from core.segment_context import (
+    build_segment_context_tables,
+    build_segment_intro,
+    resolve_segment_from_question,
 )
+from core.qa_memory import (
+    QA_CONVERSATION_SUMMARY_KEY,
+    QA_HISTORY_KEY,
+    QA_LAST_FOLLOWUP_KEY,
+    QA_LAST_FOLLOWUPS_KEY,
+    append_qa_history,
+    ensure_qa_memory,
+    get_recent_qa_history,
+    update_qa_conversation_summary,
+)
+from core.reset_state import reset_app_state
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+NAV_CONTEXT_KEY = "__NAV_CONTEXT__"
 
-def val_or_default(val, default):
-    """Retourne default si val est None, chaîne vide, ou pandas vide; sinon val."""
-    if val is None:
-        return default
-    if isinstance(val, str):
-        return val if val.strip() else default
-    if isinstance(val, (pd.DataFrame, pd.Series)):
-        return val if not val.empty else default
-    # pour listes/dicts, optionnel : if hasattr(val, "__len__") and len(val)==0: return default
-    return val
+PREPARATION_ACTIONS = {
+    "run_preparation1": run_preparation1,
+    "run_preparation2": run_preparation2,
+}
 
-def to_text(x):
-    """Sérialise pour le prompt."""
-    if isinstance(x, pd.DataFrame):
-        return x.to_csv(index=False)
-    if isinstance(x, pd.Series):
-        return x.to_csv(index=True)
-    return str(x)
+PROFILE_ACTIONS = {
+    "run_distribution_profile": run_distribution_variables,
+}
+
+SEGMENT_ACTIONS = {
+    "contextualize_segment",
+    "rerun_profils_y_for_segment",
+}
 
 
-def _find_cols_in_question(question: str, df: pd.DataFrame) -> list[str]:
-    if not isinstance(df, pd.DataFrame):
-        return []
-    qlow = question.lower()
-    cols = []
-    for c in df.columns:
-        if str(c).lower() in qlow:
-            cols.append(str(c))
-    if cols:
-        return list(dict.fromkeys(cols))
-    tokens = [t for t in qlow.replace("?", " ").replace(",", " ").split() if len(t) >= 4]
-    candidates = [str(c) for c in df.columns]
-    for tok in tokens:
-        match = difflib.get_close_matches(tok, candidates, n=1, cutoff=0.8)
-        if match:
-            cols.append(match[0])
-    return list(dict.fromkeys(cols))
+def _reset_qa_history() -> None:
+    state_resets = {
+        QA_HISTORY_KEY: [],
+        QA_CONVERSATION_SUMMARY_KEY: "",
+        QA_LAST_FOLLOWUP_KEY: "",
+        "qa_last_plan": None,
+        "qa_last_answer": None,
+        "qa_last_execution_log": [],
+        "qa_last_question": "",
+        "qa_last_subset_description": "",
+        "qa_segment_context": None,
+        "qa_segment_counts_table": None,
+        "qa_segment_percent_table": None,
+        "qa_segment_subdataset": None,
+        "qa_segment_profile_text": "",
+        "qa_segment_profils_y_text": "",
+        "qa_relationship_synthesis": "",
+        QA_LAST_FOLLOWUPS_KEY: [],
+    }
+    for key, default in state_resets.items():
+        st.session_state[key] = default
+    st.session_state.pop("qa_chat_input", None)
 
 
-def _safe_json_loads(s: str) -> dict | None:
+def to_text(value: Any) -> str:
+    if isinstance(value, pd.DataFrame):
+        return value.to_csv(index=False)
+    if isinstance(value, pd.Series):
+        return value.to_csv(index=True)
+    return str(value)
+
+
+def _safe_json_loads(raw: str) -> dict[str, Any] | None:
     try:
-        return json.loads(s)
+        return json.loads(raw)
     except Exception:
         return None
 
 
-def _goto_step(step: str):
-    """Change d'étape sans toucher aux artefacts."""
+def _goto_step(step: str) -> None:
     st.session_state["__NAV_SELECTED__"] = str(step)
+    st.session_state[NAV_CONTEXT_KEY] = "view"
     try:
         st.query_params["step"] = str(step)
     except Exception:
@@ -76,356 +102,1647 @@ def _goto_step(step: str):
         st.experimental_rerun()
 
 
-def _get_crosstab_interpretation(var_a: str, var_b: str) -> str | None:
-    items = st.session_state.get("crosstabs_interpretation", []) or []
-    for it in items:
-        xa = str(it.get("var_x"))
-        ya = str(it.get("var_y"))
-        if {xa, ya} == {var_a, var_b}:
-            return it.get("interpretation")
+def _normalize_text(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _expand_followup_reply(question: str) -> str:
+    raw = str(question or "").strip()
+    if not raw:
+        return raw
+    normalized = _normalize_text(raw)
+    followups = st.session_state.get(QA_LAST_FOLLOWUPS_KEY) or []
+    if not isinstance(followups, list):
+        followups = []
+    last_followup = str(st.session_state.get(QA_LAST_FOLLOWUP_KEY) or "").strip()
+    primary_followup = str(followups[0]).strip() if followups else last_followup
+    if not primary_followup:
+        return raw
+
+    yes_values = {"oui", "ok", "okay", "d'accord", "dac", "go", "vas-y", "volontiers", "yes", "y"}
+    no_values = {"non", "no", "nop", "pas maintenant", "non merci"}
+
+    if normalized in yes_values:
+        return primary_followup
+    if normalized in no_values:
+        return f"L'utilisateur répond non à la question de relance suivante : {primary_followup}"
+    return raw
+
+
+def _find_cols_in_question(question: str, df: pd.DataFrame) -> list[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+
+    qlow = question.lower()
+    cols: list[str] = []
+    for col in df.columns:
+        name = str(col)
+        if name.lower() in qlow:
+            cols.append(name)
+    if cols:
+        return list(dict.fromkeys(cols))
+
+    tokens = [t for t in qlow.replace("?", " ").replace(",", " ").split() if len(t) >= 4]
+    candidates = [str(c) for c in df.columns]
+    for token in tokens:
+        match = difflib.get_close_matches(token, candidates, n=1, cutoff=0.8)
+        if match:
+            cols.append(match[0])
+    return list(dict.fromkeys(cols))
+
+
+def _resolve_column_name(df: pd.DataFrame, requested: Any) -> str | None:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    raw = str(requested or "").strip()
+    if not raw:
+        return None
+    if raw in df.columns:
+        return raw
+
+    raw_norm = raw.casefold()
+    by_norm = {str(col).strip().casefold(): str(col) for col in df.columns}
+    if raw_norm in by_norm:
+        return by_norm[raw_norm]
+
+    candidates = [str(col) for col in df.columns]
+    match = difflib.get_close_matches(raw, candidates, n=1, cutoff=0.75)
+    return match[0] if match else None
+
+
+def _resolve_modality_value(df: pd.DataFrame, column: str, requested: Any) -> str | None:
+    if not isinstance(df, pd.DataFrame) or column not in df.columns:
+        return None
+    raw = str(requested or "").strip()
+    if not raw:
+        return None
+
+    values = df[column].dropna().astype("string").unique().tolist()
+    if not values:
+        return None
+
+    if raw in values:
+        return raw
+
+    by_norm = {str(value).strip().casefold(): str(value) for value in values}
+    raw_norm = raw.casefold()
+    if raw_norm in by_norm:
+        return by_norm[raw_norm]
+
+    match = difflib.get_close_matches(raw, values, n=1, cutoff=0.7)
+    return match[0] if match else None
+
+
+def _resolve_subset_from_question(question: str, df: pd.DataFrame) -> dict[str, Any] | None:
+    resolved = resolve_segment_from_question(question, df)
+    if resolved:
+        return resolved
+    last_segment = st.session_state.get("qa_segment_context") or {}
+    column = str(last_segment.get("column") or "").strip()
+    value = str(last_segment.get("value") or "").strip()
+    if not column or not value or not isinstance(df, pd.DataFrame) or column not in df.columns:
+        return None
+    qlow = _normalize_text(question)
+    if any(token in qlow for token in ["segment", "groupe", "profil", "profils", "ce groupe", "ce segment"]):
+        mask = df[column].astype("string") == value
+        subset_df = df.loc[mask].copy()
+        if not subset_df.empty:
+            return {
+                "column": column,
+                "value": value,
+                "df": subset_df,
+                "description": f"{column} = {value}",
+            }
     return None
 
 
-def _summarize_distribution(series: pd.Series) -> dict:
-    s = series.dropna()
-    if s.empty:
-        return {"summary": "Série vide.", "insight": "Aucune donnée exploitable.", "type": "empty"}
-    if pd.api.types.is_numeric_dtype(s):
-        desc = s.describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9]).to_dict()
-        skew = s.skew()
-        kurt = s.kurt()
-        zero_pct = (s == 0).mean() * 100
-        summary = (
-            f"nb={int(desc['count'])}, moy={desc['mean']:.2f}, écart-type={desc['std']:.2f}, "
-            f"min={desc['min']:.2f}, p10={desc['10%']:.2f}, médiane={desc['50%']:.2f}, p90={desc['90%']:.2f}, max={desc['max']:.2f}, "
-            f"skew={skew:.2f}, kurt={kurt:.2f}, %0={zero_pct:.1f}%"
-        )
-        insights = []
-        if skew > 0.5:
-            insights.append("distribution asymétrique à droite (valeurs élevées fréquentes)")
-        elif skew < -0.5:
-            insights.append("distribution asymétrique à gauche (valeurs faibles fréquentes)")
-        else:
-            insights.append("distribution globalement symétrique")
-
-        if kurt > 3:
-            insights.append("queues lourdes : valeurs extrêmes relativement fréquentes")
-        elif kurt < 0:
-            insights.append("distribution aplatie : peu de valeurs extrêmes")
-
-        if zero_pct > 10:
-            insights.append(f"{zero_pct:.1f}% de valeurs nulles")
-
-        return {"summary": summary, "insight": "; ".join(insights), "type": "numeric"}
-    # Discrète
-    counts = s.value_counts(normalize=True)
-    gini = 1 - (counts ** 2).sum()
-    top = counts.head(5).apply(lambda x: f"{x*100:.1f}%").to_dict()
-    main_mod = counts.head(1)
-    if not main_mod.empty:
-        mode_label, mode_pct = main_mod.index[0], main_mod.iloc[0] * 100
-        insight = f"modalité principale '{mode_label}' ({mode_pct:.1f}%), dispersion Gini={gini:.2f}"
-    else:
-        insight = f"dispersion Gini={gini:.2f}"
-    summary = f"modalités={len(counts)}, Gini={gini:.2f}, top5={top}"
-    return {"summary": summary, "insight": insight, "type": "categorical"}
-
-
-def _render_compact_answer(question: str, df_ready: pd.DataFrame):
-    if not isinstance(df_ready, pd.DataFrame) or df_ready.empty:
+def _build_category_context_table(df: pd.DataFrame, column: str) -> pd.DataFrame | None:
+    if not isinstance(df, pd.DataFrame) or column not in df.columns:
         return None
-    return None  # remplacé par le flux piloté par LLM
+    counts = df[column].astype("string").value_counts(dropna=False)
+    if counts.empty:
+        return None
+    total = int(counts.sum())
+    context_df = pd.DataFrame(
+        {
+            "Modalité": [str(idx) for idx in counts.index.tolist()],
+            "Effectif": counts.astype(int).tolist(),
+            "%": [round((int(val) / total) * 100, 1) if total else 0.0 for val in counts.tolist()],
+        }
+    )
+    return context_df
 
 
-def _ensure_artifacts(question: str, df_ready: pd.DataFrame | None = None):
-    ql = question.lower()
-    need_crosstab = any(k in ql for k in ("crosstab", "croisé", "relation", "impact", "comparaison"))
-    need_dist = any(k in ql for k in ("histogram", "distribution", "répartition", "décile", "quantile", "top décile"))
-    if need_crosstab:
-        st.session_state["__QA_FORCE_CROSSTABS__"] = True
-        st.session_state["run_sankey_crosstabs"] = True
-        run_crosstabs_detail()
-    if need_dist:
-        st.session_state["generate_distribution_figures"] = True
-        run_distributions_detail()
+def _get_crosstab_item(var_a: str, var_b: str) -> dict[str, Any] | None:
+    items = st.session_state.get("crosstabs_interpretation", []) or []
+    for item in items:
+        xa = str(item.get("var_x"))
+        ya = str(item.get("var_y"))
+        if {xa, ya} == {var_a, var_b}:
+            return item
+    return None
 
 
-def _render_artifacts():
-    rendered = False
-    ct_items = st.session_state.get("crosstabs_interpretation", []) or []
-    for item in ct_items:
-        st.markdown(f"**{item.get('var_x')} vs {item.get('var_y')}**")
-        st.write(item.get("interpretation", ""))
-        img_bytes = item.get("heatmap_png")
-        if isinstance(img_bytes, (bytes, bytearray, memoryview)):
-            st.image(img_bytes)
-        rendered = True
-    dist_items = st.session_state.get("figs_variables_distribution_detailed") or st.session_state.get("figs_variables_distribution") or []
-    for item in dist_items:
-        st.markdown(f"**{item.get('title','Distribution')}**")
-        img_bytes = item.get("png")
-        if isinstance(img_bytes, (bytes, bytearray, memoryview)):
-            st.image(img_bytes)
-            rendered = True
-    return rendered
+def _get_distribution_item(var_name: str) -> dict[str, Any] | None:
+    items = (
+        st.session_state.get("figs_variables_distribution_detailed")
+        or st.session_state.get("figs_variables_distribution")
+        or []
+    )
+    for item in items:
+        if str(item.get("title", "")).strip().casefold() == str(var_name).strip().casefold():
+            return item
+    return None
 
 
-def summarize_sankey_pairs(results_store, max_items: int = 20):
-    """Resume sankey_pair_results pour payload LLM (compact)."""
+def _build_relationship_pairs_and_variables(
+    raw_pairs: list[Any],
+    raw_variables: list[Any],
+    matched_columns: list[str],
+    df_ready: pd.DataFrame,
+) -> tuple[list[list[str]], list[str]]:
+    pairs: list[list[str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    variables: list[str] = []
+
+    for pair in raw_pairs or []:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        left = _resolve_column_name(df_ready, pair[0])
+        right = _resolve_column_name(df_ready, pair[1])
+        if not left or not right or left == right:
+            continue
+        key = tuple(sorted([left, right]))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        pairs.append([left, right])
+        if left not in variables:
+            variables.append(left)
+        if right not in variables:
+            variables.append(right)
+
+    for item in raw_variables or []:
+        column = _resolve_column_name(df_ready, item)
+        if column and column not in variables:
+            variables.append(column)
+
+    if not pairs and len(matched_columns) >= 2:
+        base_pair = [matched_columns[0], matched_columns[1]]
+        pairs.append(base_pair)
+        for column in base_pair:
+            if column not in variables:
+                variables.append(column)
+
+    if not variables:
+        variables = matched_columns[:3]
+
+    if len(variables) >= 3 and len(pairs) < 2:
+        focus = variables[0]
+        for other in variables[1:3]:
+            candidate = tuple(sorted([focus, other]))
+            if focus != other and candidate not in seen_pairs:
+                seen_pairs.add(candidate)
+                pairs.append([focus, other])
+
+    return pairs, variables[:4]
+
+
+def _build_planner_capability_guide(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    guide: list[dict[str, Any]] = []
+    for item in catalog:
+        guide.append(
+            {
+                "action": str(item.get("action") or "").strip(),
+                "when_to_use": str(item.get("when_to_use") or "").strip(),
+                "example_questions": [str(q).strip() for q in (item.get("example_questions") or []) if str(q).strip()][:4],
+                "example_parameters": (item.get("example_parameters") or [])[:3],
+                "params_schema": item.get("params_schema") or [],
+            }
+        )
+    return guide
+
+
+def _generate_relationship_synthesis(question: str, pairs: list[list[str]], variables: list[str]) -> str:
+    crosstab_payload = []
+    for pair in pairs:
+        item = _get_crosstab_item(pair[0], pair[1])
+        if not isinstance(item, dict):
+            continue
+        crosstab_payload.append(
+            {
+                "var_x": item.get("var_x"),
+                "var_y": item.get("var_y"),
+                "interpretation": str(item.get("interpretation") or "").strip(),
+                "v": item.get("v"),
+                "p": item.get("p"),
+            }
+        )
+
+    distribution_payload = []
+    for variable in variables:
+        item = _get_distribution_item(variable)
+        if not isinstance(item, dict):
+            continue
+        distribution_payload.append(
+            {
+                "variable": variable,
+                "metrics_caption": str(item.get("metrics_caption") or "").strip(),
+            }
+        )
+
+    if not crosstab_payload and not distribution_payload:
+        return ""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Tu synthétises une analyse de relations entre variables. "
+                    "Réponds en français, en 3 à 6 phrases maximum, sans jargon interne. "
+                    "Appuie-toi d'abord sur les tris croisés et complète par les distributions si elles apportent du contexte utile."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "question": question,
+                        "pairs": pairs,
+                        "variables": variables,
+                        "crosstabs": crosstab_payload,
+                        "distributions": distribution_payload,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            },
+        ],
+    )
+    return str(response.choices[0].message.content or "").strip()
+
+
+def summarize_sankey_pairs(results_store: Any, max_items: int = 20) -> list[dict[str, Any]]:
     if not isinstance(results_store, dict) or not results_store:
         return []
 
     rows = []
-    for pair_id, r in results_store.items():
-        interp = str(r.get("interpretation", "") or "").strip()
-        if len(interp) > 500:
-            interp = interp[:500] + "..."
+    for pair_id, item in results_store.items():
+        interpretation = str(item.get("interpretation", "") or "").strip()
+        if len(interpretation) > 500:
+            interpretation = interpretation[:500] + "..."
         rows.append(
             {
                 "pair_id": pair_id,
-                "var_x": r.get("var_x"),
-                "var_y": r.get("var_y"),
-                "v": r.get("v"),
-                "p": r.get("p"),
-                "chi2": r.get("chi2"),
-                "interpretation": interp,
+                "var_x": item.get("var_x"),
+                "var_y": item.get("var_y"),
+                "v": item.get("v"),
+                "p": item.get("p"),
+                "chi2": item.get("chi2"),
+                "interpretation": interpretation,
             }
         )
 
-    rows.sort(key=lambda x: float(x.get("v") or 0), reverse=True)
+    rows.sort(key=lambda row: float(row.get("v") or 0), reverse=True)
     return rows[:max_items]
 
 
-def _llm_plan(
-    question: str,
-    df_ready: pd.DataFrame,
-    dataset_context,
-    crosstabs_interpretation,
-    sankey_pair_results,
-    sankey_latents,
-    extra_payload: dict | None = None,
-):
-    if not isinstance(df_ready, pd.DataFrame) or df_ready.empty:
-        return None
+def _sample_top_modalities(df: pd.DataFrame, columns: list[str], max_values: int = 5) -> dict[str, list[str]]:
+    sample: dict[str, list[str]] = {}
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return sample
+    for column in columns:
+        if column not in df.columns:
+            continue
+        try:
+            values = (
+                df[column]
+                .dropna()
+                .astype("string")
+                .value_counts(dropna=True)
+                .head(max_values)
+                .index.tolist()
+            )
+            sample[column] = [str(value) for value in values]
+        except Exception:
+            continue
+    return sample
 
-    preview = df_ready.head(10).to_csv(index=False)
-    preview = preview[:20000]
 
-    payload = {
-        "columns": [str(c) for c in df_ready.columns],
+def _build_question_payload(question: str, df_ready: pd.DataFrame) -> dict[str, Any]:
+    matched_columns = _find_cols_in_question(question, df_ready) if isinstance(df_ready, pd.DataFrame) else []
+    target_variables = [str(item) for item in (st.session_state.get("target_variables", []) or [])]
+    illustrative_variables = [str(item) for item in (st.session_state.get("illustrative_variables", []) or [])]
+    columns_for_modalities = list(dict.fromkeys(target_variables + matched_columns[:6]))
+
+    preview = ""
+    if isinstance(df_ready, pd.DataFrame) and not df_ready.empty:
+        preview = df_ready.head(12).to_csv(index=False)
+        preview = preview[:20000]
+
+    return {
+        "question": question,
+        "columns": [str(col) for col in df_ready.columns] if isinstance(df_ready, pd.DataFrame) else [],
+        "matched_columns": matched_columns,
+        "target_variables": target_variables,
+        "illustrative_variables": illustrative_variables,
+        "top_modalities_by_column": _sample_top_modalities(df_ready, columns_for_modalities),
+        "dataset_context": st.session_state.get("dataset_context"),
+        "dataset_recommendations": st.session_state.get("dataset_recommendations"),
+        "global_synthesis": st.session_state.get("global_synthesis"),
+        "data_preparation_synthesis": st.session_state.get("data_preparation_synthesis"),
+        "sankey_interpretation_synthesis": st.session_state.get("sankey_interpretation_synthesis"),
+        "profil_dominant_analysis": st.session_state.get("profil_dominant_analysis"),
+        "qa_segment_profile_text": st.session_state.get("qa_segment_profile_text"),
+        "qa_segment_profils_y_text": st.session_state.get("qa_segment_profils_y_text"),
+        "latent_summary_text": st.session_state.get("latent_summary_text"),
+        "sankey_pair_results_summary": summarize_sankey_pairs(
+            st.session_state.get("sankey_pair_results", {}),
+            max_items=20,
+        ),
+        "sankey_latents_csv": to_text(st.session_state.get("sankey_latents"))
+        if isinstance(st.session_state.get("sankey_latents"), pd.DataFrame)
+        else "",
+        "crosstabs_interpretation": [
+            {
+                "var_x": item.get("var_x"),
+                "var_y": item.get("var_y"),
+                "interpretation": item.get("interpretation", ""),
+            }
+            for item in (st.session_state.get("crosstabs_interpretation") or [])
+            if isinstance(item, dict)
+        ],
         "data_sample_preview_as_csv": preview,
-        "target_variables": st.session_state.get("target_variables", []),
-        "illustrative_variables": st.session_state.get("illustrative_variables", []),
-        "crosstabs_interpretation": crosstabs_interpretation,
-        "sankey_pair_results_summary": summarize_sankey_pairs(sankey_pair_results, max_items=20),
-        "sankey_latents_csv": to_text(sankey_latents) if isinstance(sankey_latents, pd.DataFrame) else "",
-        "dataset_context": dataset_context,
+        "qa_recent_history": get_recent_qa_history(),
+        "qa_conversation_summary": st.session_state.get(QA_CONVERSATION_SUMMARY_KEY, ""),
+        "qa_last_followup_question": st.session_state.get(QA_LAST_FOLLOWUP_KEY, ""),
     }
-    if extra_payload:
-        payload.update(extra_payload)
 
-    sys_prompt = """Vous êtes un expert en analyse de données. Répondez en français, clair et concis.
 
-Tâche: produire un plan JSON permettant d'exécuter les calculs adaptés à la question.
-Étapes obligatoires :
-1) Vérifiez si les artefacts fournis suffisent pour répondre.
-2) Repérez dans la question des variables du dataset (limitez-vous aux noms présents dans "columns", tolérance sémantique ok). Choisissez 1 à 10 variables max.
-3) Proposez les modules pertinents : crosstab, distribution, profils_y, analyse descriptive. Pour crosstab, donnez les paires var_a/var_b.
-4) Si un calcul est pertinent, incluez-le dans le JSON. Sinon, notez pourquoi.
-5) Ne créez pas de variables ou scores inexistants.
+def _plan_qa_actions(question: str, df_ready: pd.DataFrame) -> dict[str, Any]:
+    if not isinstance(df_ready, pd.DataFrame) or df_ready.empty:
+        return {
+            "can_answer_from_existing": False,
+            "actions": [],
+            "internal_notes": "dataset indisponible",
+            "raw_answer": "",
+        }
 
-Format de sortie STRICT JSON:
-{"crosstabs":[["var_a","var_b"],...],"distributions":["var_x",...],"notes":"texte bref"}
-Pas de texte hors JSON.
+    payload = _build_question_payload(question, df_ready)
+    catalog = get_analysis_capability_catalog()
+    payload["capability_catalog"] = catalog
+    payload["capability_guide"] = _build_planner_capability_guide(catalog)
+    payload["available_actions"] = [item["action"] for item in catalog]
+    payload["artefacts_available"] = {
+        "global_synthesis": bool(str(st.session_state.get("global_synthesis") or "").strip()),
+        "data_preparation_synthesis": bool(str(st.session_state.get("data_preparation_synthesis") or "").strip()),
+        "sankey": bool(st.session_state.get("sankey_diagram")),
+        "sankey_text": bool(str(st.session_state.get("sankey_interpretation_synthesis") or "").strip()),
+        "profils_y": bool(str(st.session_state.get("profils_y_text") or "").strip()),
+        "qa_segment_profils_y_text": bool(str(st.session_state.get("qa_segment_profils_y_text") or "").strip()),
+        "profil_dominant_analysis": bool(str(st.session_state.get("profil_dominant_analysis") or "").strip()),
+        "qa_segment_profile_text": bool(str(st.session_state.get("qa_segment_profile_text") or "").strip()),
+        "crosstabs": bool(st.session_state.get("crosstabs_interpretation")),
+        "distributions": bool(
+            st.session_state.get("figs_variables_distribution_detailed")
+            or st.session_state.get("figs_variables_distribution")
+        ),
+    }
+
+    sys_prompt = """Tu es l'orchestrateur Q&A d'une application Streamlit d'analyse d'enquêtes.
+Réponds uniquement par un JSON strict.
+
+Objectif :
+1. Dire si les artefacts existants suffisent pour répondre à la question.
+2. Si non, choisir les actions nécessaires parmi available_actions.
+3. Déduire si la question demande une nouvelle variable cible, une nouvelle modalité de cible,
+   des tris croisés, des distributions, ou l'exécution d'un module de préparation.
+
+Le payload contient aussi "capability_guide". Pour chaque action, tu dois utiliser :
+- "when_to_use" pour comprendre l'intention métier,
+- "example_questions" pour rapprocher la question utilisateur d'un cas d'usage,
+- "example_parameters" pour choisir des paramètres plausibles et cohérents.
+
+Règles :
+- N'utilise que des noms de colonnes présents dans "columns".
+- Ne crée aucune variable ni score inexistant.
+- Compare explicitement la question utilisateur aux exemples du "capability_guide" avant de choisir une action.
+- Si la question porte sur une catégorie d'observations identifiable (ex. race=Black), utilise d'abord "contextualize_segment".
+- Si la question porte sur une nouvelle variable cible, utilise l'action "rerun_sankey".
+- Si la question porte sur une nouvelle modalité de cible, utilise l'action "rerun_profils_y".
+- Si la question demande plutôt un portrait / profil majoritaire ou la description d'une catégorie sans cible analytique explicite, utilise "run_distribution_profile" après "contextualize_segment".
+- Si la question demande comment les profils se distinguent au sein d'un groupe ou demande plus de détail sur un segment, utilise "rerun_profils_y_for_segment".
+- Si la question porte sur une relation, un lien, une comparaison ou un croisement entre variables, utilise en priorité "analyze_relationships".
+- Si des tris croisés sont nécessaires, utilise "run_crosstabs" avec des paires de variables.
+- Si des histogrammes ou distributions sont nécessaires, utilise "run_distributions".
+- Si la réponse doit montrer un module de préparation, utilise "run_preparation1" ou "run_preparation2".
+- Si les artefacts existants suffisent, laisse "actions" vide.
+- "internal_notes" est réservé à l'app et ne sera pas affiché à l'utilisateur.
+
+Format attendu :
+{
+  "can_answer_from_existing": true|false,
+  "actions": [
+    {
+      "action": "contextualize_segment" | "analyze_relationships" | "run_crosstabs" | "run_distributions" | "run_distribution_profile" | "rerun_sankey" | "rerun_profils_y" | "rerun_profils_y_for_segment" | "run_preparation1" | "run_preparation2",
+      "target_variable": "nom de colonne optionnel",
+      "target_modality": "modalité optionnelle",
+      "source_column": "nom de colonne optionnel",
+      "source_value": "valeur optionnelle",
+      "pairs": [["var_a","var_b"]],
+      "variables": ["var_x"],
+      "reason": "texte bref"
+    }
+  ],
+  "internal_notes": "texte bref"
+}
 """
 
-    user_prompt = json.dumps(
-        {
-            "question": question,
-            "columns": payload.get("columns"),
-            "target_variables": payload.get("target_variables"),
-            "illustrative_variables": payload.get("illustrative_variables"),
-            "artefacts_available": {
-                "crosstabs_interpretation": bool(crosstabs_interpretation),
-                "sankey_pairs": bool(sankey_pair_results),
-                "sankey_latents": bool(sankey_latents is not None),
-                "dataset_context": bool(dataset_context),
-            },
-        },
-        ensure_ascii=False,
-    )
-
-    r = client.chat.completions.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0,
         messages=[
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
         ],
     )
-    raw_answer = r.choices[0].message.content
-    plan = _safe_json_loads(raw_answer or "")
-    if not plan:
-        return {"raw_answer": raw_answer or ""}
+    raw_answer = response.choices[0].message.content or ""
+    plan = _safe_json_loads(raw_answer) or {}
     plan["raw_answer"] = raw_answer
-    # Sanitization
-    plan["crosstabs"] = [p for p in plan.get("crosstabs", []) if isinstance(p, (list, tuple)) and len(p) >= 2]
-    plan["distributions"] = [v for v in plan.get("distributions", []) if isinstance(v, str)]
     return plan
 
-def run():
-    # États init
-    st.session_state.setdefault("profil_dominant", None)
-    st.session_state.setdefault("profils", None)
-    st.session_state.setdefault("interpretationACM", None)
 
-    # Récupération des données (sans 'or' ambigu)
-    dataset_object = st.session_state.get('dataset_object')
-    dataset_context = st.session_state.get('dataset_context')
-    dataset_recommendations = st.session_state.get('dataset_recommendations')
-    key_questions_answer = st.session_state.get('key_questions_answer')
-    target_profiles_text = st.session_state.get('target_profiles_text')
-    profil_dominant_analysis = st.session_state.get('profil_dominant_analysis')
-    dominant_continues = st.session_state.get('dominant_continues')
-    dominant_discretes = st.session_state.get('dominant_discretes')
-    interpretationACM = st.session_state.get('interpretationACM')
-    dendrogram_interpretation = st.session_state.get('dendrogram_interpretation')
-    latent_summary_text = st.session_state.get('latent_summary_text')
-    fig_dendro = st.session_state.get('dendrogram')
-    segmentation_profiles_text = st.session_state.get('segmentation_profiles_text')
-    target_profiles_table = st.session_state.get('target_profiles_table')
-    segmentation_profiles_table = st.session_state.get('segmentation_profiles_table')
-    segmentation_detailed_profiles = st.session_state.get('segmentation_detailed_profiles')
-    ctas_rules_text = st.session_state.get('ctas_rules_text')
-    process = st.session_state.get('process')
-    figs_variables_distribution = st.session_state.get("figs_variables_distribution", [])
-    dataset_characteristics  = st.session_state.get("dataset_characteristics")
-    variables_raw = st.session_state.get("variables_raw")
-    data_preparation_synthesis = st.session_state.get("data_preparation_synthesis")    
-    fig_missing_percentages = st.session_state.get("fig_missing_percentages")
-    fig_missing_correlation_heatmap = st.session_state.get("fig_missing_correlation_heatmap")
-    fig_missing_correlation_dendrogram = st.session_state.get("fig_missing_correlation_dendrogram")
-    little_test_result = st.session_state.get("little_test_result")
-    df_ready = st.session_state.get("df_ready")
-    sankey_interpretation_synthesis = st.session_state.get("sankey_interpretation_synthesis")
-    raw_crosstabs = st.session_state.get("crosstabs_interpretation") or []
-    crosstabs_interpretation = []
-    for item in raw_crosstabs:
-        try:
-            crosstabs_interpretation.append({
-                "var_x": item.get("var_x"),
-                "var_y": item.get("var_y"),
-                "interpretation": item.get("interpretation", ""),
-            })
-        except Exception:
+def _sanitize_plan(plan: dict[str, Any], question: str, df_ready: pd.DataFrame) -> dict[str, Any]:
+    allowed_actions = {item["action"] for item in get_analysis_capability_catalog()}
+    matched_columns = _find_cols_in_question(question, df_ready)
+    segment_info = _resolve_subset_from_question(question, df_ready)
+    qlow = question.casefold()
+    wants_category_profile = (
+        any(keyword in qlow for keyword in ["profil", "portrait", "décrit", "decrit", "catégorie", "categorie", "segment", "qui sont", "ressembl"])
+        and not any(keyword in qlow for keyword in ["cible", "modalité cible", "modalite cible", "top 20", "bottom 20"])
+    )
+    wants_segment_context = bool(
+        segment_info
+        and any(
+            keyword in qlow
+            for keyword in ["profil", "portrait", "catégorie", "categorie", "segment", "combien", "part", "proportion", "représent", "represent"]
+        )
+    )
+
+    wants_segment_deep_dive = bool(
+        segment_info
+        and any(
+            keyword in qlow
+            for keyword in [
+                "dÃ©tail",
+                "detail",
+                "dÃ©taill",
+                "distingu",
+                "caractÃ©ris",
+                "caracteris",
+                "approfond",
+                "plus en dÃ©tail",
+                "plus en detail",
+            ]
+        )
+    )
+
+    sanitized: dict[str, Any] = {
+        "can_answer_from_existing": bool(plan.get("can_answer_from_existing", False)),
+        "internal_notes": str(plan.get("internal_notes") or "").strip(),
+        "actions": [],
+        "raw_answer": plan.get("raw_answer", ""),
+    }
+
+    raw_actions = plan.get("actions", [])
+    if not isinstance(raw_actions, list):
+        raw_actions = []
+
+    seen_keys: set[tuple[Any, ...]] = set()
+
+    for raw_action in raw_actions:
+        if not isinstance(raw_action, dict):
             continue
-    sankey_pair_results = st.session_state.get("sankey_pair_results", {})
-    sankey_latents = st.session_state.get("sankey_latents")
-    global_synthesis = st.session_state.get("global_synthesis")
- 
-    st.subheader("Q&A")
+        action_name = str(raw_action.get("action") or "").strip()
+        if action_name not in allowed_actions:
+            continue
 
-    # Saisie
-    question = st.text_input("Posez une question sur un aspect spécifique posé par le jeu de données :")
+        action: dict[str, Any] = {
+            "action": action_name,
+            "reason": str(raw_action.get("reason") or "").strip(),
+        }
 
-    plan = None
-    if st.button("Envoyer"):
-        if not question.strip():
-            st.warning("Veuillez poser une question.")
-        else:
-            try:
-                st.session_state["__QA_SUBMITTED__"] = True
-                _ensure_artifacts(question, df_ready)
-                # Pilotage par LLM : plan JSON -> exécution crosstabs/distributions
-                plan = _llm_plan(
-                    question,
-                    df_ready,
-                    dataset_context,
-                    crosstabs_interpretation,
-                    sankey_pair_results,
-                    sankey_latents,
+        if action_name == "analyze_relationships":
+            pairs, variables = _build_relationship_pairs_and_variables(
+                raw_action.get("pairs", []) or [],
+                raw_action.get("variables", []) or [],
+                matched_columns,
+                df_ready,
+            )
+            if pairs:
+                action["pairs"] = pairs
+                action["variables"] = variables
+                sanitized["actions"].append(action)
+
+        elif action_name == "run_crosstabs":
+            pairs: list[list[str]] = []
+            for pair in raw_action.get("pairs", []) or []:
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                left = _resolve_column_name(df_ready, pair[0])
+                right = _resolve_column_name(df_ready, pair[1])
+                if not left or not right or left == right:
+                    continue
+                normalized_pair = tuple(sorted([left, right]))
+                if normalized_pair in seen_keys:
+                    continue
+                seen_keys.add(normalized_pair)
+                pairs.append([left, right])
+
+            if not pairs and len(matched_columns) >= 2:
+                fallback = [matched_columns[0], matched_columns[1]]
+                key = tuple(sorted(fallback))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    pairs.append(fallback)
+
+            if pairs:
+                action["pairs"] = pairs
+                sanitized["actions"].append(action)
+
+        elif action_name == "run_distributions":
+            variables: list[str] = []
+            for item in raw_action.get("variables", []) or []:
+                column = _resolve_column_name(df_ready, item)
+                if not column or column in variables:
+                    continue
+                variables.append(column)
+
+            if not variables:
+                for column in matched_columns[:3]:
+                    if column not in variables:
+                        variables.append(column)
+
+            if variables:
+                action["variables"] = variables
+                sanitized["actions"].append(action)
+
+        elif action_name == "rerun_sankey":
+            target_variable = _resolve_column_name(df_ready, raw_action.get("target_variable"))
+            if target_variable:
+                action["target_variable"] = target_variable
+                sanitized["actions"].append(action)
+
+        elif action_name == "rerun_profils_y":
+            if wants_category_profile:
+                continue
+            target_variable = _resolve_column_name(
+                df_ready,
+                raw_action.get("target_variable") or (matched_columns[0] if matched_columns else None),
+            )
+            target_modality = _resolve_modality_value(df_ready, target_variable, raw_action.get("target_modality"))
+            if target_variable and target_modality:
+                action["target_variable"] = target_variable
+                action["target_modality"] = target_modality
+                sanitized["actions"].append(action)
+
+        elif action_name == "rerun_profils_y_for_segment":
+            if segment_info:
+                action["source_column"] = str(segment_info.get("column") or "")
+                action["source_value"] = str(segment_info.get("value") or "")
+                sanitized["actions"].append(action)
+
+        elif action_name in PROFILE_ACTIONS or action_name in SEGMENT_ACTIONS:
+            sanitized["actions"].append(action)
+
+        elif action_name in PREPARATION_ACTIONS:
+            sanitized["actions"].append(action)
+
+    if not sanitized["actions"] and matched_columns:
+        if wants_category_profile:
+            sanitized["actions"].append(
+                {
+                    "action": "run_distribution_profile",
+                    "reason": "fallback heuristique sur une demande de portrait ou profil majoritaire",
+                }
+            )
+        elif any(keyword in qlow for keyword in ["croisé", "croise", "crosstab", "relation", "impact"]) and len(matched_columns) >= 2:
+            sanitized["actions"].append(
+                {
+                    "action": "run_crosstabs",
+                    "pairs": [[matched_columns[0], matched_columns[1]]],
+                    "reason": "fallback heuristique sur les variables citées dans la question",
+                }
+            )
+        elif any(keyword in qlow for keyword in ["distribution", "histogram", "répartition", "repartition"]):
+            sanitized["actions"].append(
+                {
+                    "action": "run_distributions",
+                    "variables": matched_columns[:3],
+                    "reason": "fallback heuristique sur les variables citées dans la question",
+                }
+            )
+
+    if wants_segment_context and not any(action.get("action") == "contextualize_segment" for action in sanitized["actions"]):
+        sanitized["actions"].insert(
+            0,
+            {
+                "action": "contextualize_segment",
+                "reason": "la question porte sur une catégorie identifiable à situer dans l'échantillon global",
+            },
+        )
+
+    if wants_category_profile:
+        sanitized["actions"] = [action for action in sanitized["actions"] if action.get("action") != "rerun_profils_y"]
+        if not any(action.get("action") == "run_distribution_profile" for action in sanitized["actions"]):
+            sanitized["actions"].insert(
+                1 if sanitized["actions"] and sanitized["actions"][0].get("action") == "contextualize_segment" else 0,
+                {
+                    "action": "run_distribution_profile",
+                    "reason": "demande de portrait ou de description d'une catégorie sans cible analytique explicite",
+                },
+            )
+
+    if wants_segment_deep_dive:
+        sanitized["actions"] = [action for action in sanitized["actions"] if action.get("action") != "rerun_profils_y"]
+        if not any(action.get("action") == "rerun_profils_y_for_segment" for action in sanitized["actions"]):
+            insert_at = 0
+            for idx, action in enumerate(sanitized["actions"]):
+                if action.get("action") in {"contextualize_segment", "run_distribution_profile"}:
+                    insert_at = idx + 1
+            sanitized["actions"].insert(
+                insert_at,
+                {
+                    "action": "rerun_profils_y_for_segment",
+                    "reason": "demande d'approfondissement sur un segment par comparaison au reste de l'Ã©chantillon",
+                },
+            )
+
+    if any(keyword in qlow for keyword in ["croisÃ©", "croise", "crosstab", "relation", "impact", "lien", "compare"]) and len(matched_columns) >= 2:
+        relation_actions = [action for action in sanitized["actions"] if action.get("action") in {"run_crosstabs", "run_distributions", "analyze_relationships"}]
+        if relation_actions or not sanitized["actions"]:
+            pairs, variables = _build_relationship_pairs_and_variables(
+                [pair for action in relation_actions for pair in (action.get("pairs") or [])],
+                [var for action in relation_actions for var in (action.get("variables") or [])],
+                matched_columns,
+                df_ready,
+            )
+            if pairs:
+                sanitized["actions"] = [
+                    action
+                    for action in sanitized["actions"]
+                    if action.get("action") not in {"run_crosstabs", "run_distributions", "analyze_relationships"}
+                ]
+                sanitized["actions"].append(
+                    {
+                        "action": "analyze_relationships",
+                        "pairs": pairs,
+                        "variables": variables,
+                        "reason": "question de relation ou de croisement entre variables",
+                    }
                 )
-                if plan:
-                    # notes éventuelles
-                    notes = plan.get("notes") or plan.get("comment") or ""
-                    if notes:
-                        st.markdown(f"**Notes LLM :** {notes}")
 
-                    # Crosstabs demandés
-                    for pair in plan.get("crosstabs", []):
-                        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
-                            continue
-                        var_a, var_b = str(pair[0]), str(pair[1])
-                        if var_a not in df_ready.columns or var_b not in df_ready.columns:
-                            st.warning(f"Crosstab ignoré (variables absentes) : {var_a}, {var_b}")
-                            continue
-                        interp_session = _get_crosstab_interpretation(var_a, var_b)
-                        ct_res = summarize_crosstab(
-                            df_ready,
-                            var_a,
-                            var_b,
-                            num_quantiles=st.session_state.get("num_quantiles", 5),
-                            mod_freq_min=st.session_state.get("mod_freq_min", 0.9),
-                            distinct_threshold_continuous=st.session_state.get("distinct_threshold_continuous", 5),
-                            top=5,
-                            crosstab_fn=crosstab_with_std_residuals,
-                            heatmap_fn=crosstab_heatmap_png,
-                            interpretation_fn=interpret_crosstab_with_llm if interp_session is None else None,
-                        )
-                        if interp_session:
-                            ct_res["interpretation"] = interp_session
-                        # Affichage
-                        interp_txt = ct_res.get("interpretation")
-                        if interp_txt:
-                            st.write(interp_txt)
-                        if ct_res.get("heatmap_png"):
-                            st.markdown("**Carte de chaleur du crosstab**")
-                            st.image(ct_res["heatmap_png"])
-                        caption_lines = [ct_res.get("summary", "")]
-                        if not interp_txt:
-                            caption_lines.append("Interprétation non disponible pour ce couple de variables.")
-                        if ct_res.get("v") is not None:
-                            try:
-                                caption_lines.append(f"V de Cramer : {float(ct_res.get('v')):.2f}")
-                            except Exception:
-                                pass
-                        elif ct_res.get("assoc"):
-                            caption_lines.append(ct_res["assoc"])
-                        caption_lines.append(
-                            "Lecture : vert = surreprésentation, rouge = sous-représentation par rapport à l’indépendance (résidus standardisés, après discrétisation éventuelle des variables continues)."
-                        )
-                        st.caption("\n".join([c for c in caption_lines if c]))
+    if sanitized["actions"]:
+        sanitized["can_answer_from_existing"] = False
 
-                    # Distributions demandées
-                    for var in plan.get("distributions", []):
-                        if var not in df_ready.columns:
-                            st.warning(f"Distribution ignorée (variable absente) : {var}")
-                            continue
-                        dist_info = _summarize_distribution(df_ready[var])
-                        summary_txt = dist_info.get("summary", "")
-                        insight_txt = dist_info.get("insight", "")
-                        dist_items = (
-                            st.session_state.get("figs_variables_distribution_detailed")
-                            or st.session_state.get("figs_variables_distribution")
-                            or []
-                        )
-                        shown = False
-                        for item in dist_items:
-                            title = str(item.get("title", "")).lower()
-                            if var.lower() in title:
-                                img_bytes = item.get("png")
-                                if isinstance(img_bytes, (bytes, bytearray, memoryview)):
-                                    st.subheader(f"Distribution de {var}")
-                                    st.image(img_bytes)
-                                    if insight_txt:
-                                        st.caption(f"Interprétation : {insight_txt}")
-                                    shown = True
-                                    break
-                        st.caption(f"{var} — {summary_txt}")
-                        if insight_txt and not shown:
-                            st.caption(f"Interprétation : {insight_txt}")
-            except Exception as e:
-                st.error(f"Erreur d'appel à l'API OpenAI : {e}")
+    return sanitized
+
+
+def _set_target_variable_for_qa(target_variable: str) -> None:
+    existing_targets = [str(item) for item in (st.session_state.get("target_variables", []) or []) if str(item) != target_variable]
+    st.session_state["target_variables"] = [target_variable] + existing_targets
+    st.session_state["brief_target_variable"] = target_variable
+
+
+def _set_target_modality_for_qa(target_variable: str, target_modality: str) -> None:
+    target_modalities = st.session_state.get("target_modalities", {}) or {}
+    target_modalities[target_variable] = target_modality
+    st.session_state["target_modalities"] = target_modalities
+
+
+def _slugify_segment_token(value: str) -> str:
+    token = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value or "").strip())
+    while "__" in token:
+        token = token.replace("__", "_")
+    return token.strip("_") or "segment"
+
+
+def _build_segment_binary_target(df: pd.DataFrame, column: str, value: str) -> tuple[pd.DataFrame, str, str]:
+    safe_column = _slugify_segment_token(column)
+    safe_value = _slugify_segment_token(value)
+    derived_target = f"__qa_target__{safe_column}_{safe_value}"
+    df_segment = df.copy()
+    mask = df_segment[column].astype("string").fillna("") == str(value)
+    df_segment[derived_target] = mask.map({True: "segment", False: "reste"})
+    return df_segment, derived_target, "segment"
+
+
+def _format_segment_label(column: str, value: str) -> str:
+    value_text = str(value or "").strip()
+    column_text = str(column or "").strip()
+    if not value_text:
+        return column_text
+    if not column_text:
+        return value_text
+    return f"{value_text} ({column_text})"
+
+
+def _rewrite_segment_profils_text(text: str, column: str, value: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    lines = raw.splitlines()
+    segment_label = _format_segment_label(column, value)
+    objective = f"Objectif : voici comment se distinguent les profils au sein du groupe '{segment_label}'."
+    if lines and lines[0].strip().lower().startswith("objectif"):
+        lines[0] = objective
+        return "\n".join(lines).strip()
+    return f"{objective}\n\n{raw}"
+
+
+def _get_recent_suggested_questions(max_items: int = 10) -> list[str]:
+    suggestions: list[str] = []
+    for item in get_recent_qa_history(max_items=max_items):
+        for followup in item.get("followup_questions") or []:
+            text = str(followup or "").strip()
+            if text and text not in suggestions:
+                suggestions.append(text)
+    return suggestions
+
+
+def _canonical_question(text: str) -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in str(text or "").strip())
+    return " ".join(normalized.split())
+
+
+def _build_adaptive_followups(
+    question: str,
+    execution_log: list[dict[str, Any]],
+    llm_followups: list[str],
+) -> list[str]:
+    previous = {_canonical_question(item): item for item in _get_recent_suggested_questions()}
+    normalized_question = _canonical_question(question)
+    recent_history = get_recent_qa_history(max_items=6)
+    recent_actions = {
+        str(action.get("action") or "").strip()
+        for turn in recent_history
+        for action in (turn.get("execution_log") or [])
+        if isinstance(action, dict)
+    }
+    followups: list[str] = []
+
+    for item in llm_followups:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        lowered = _canonical_question(text)
+        if lowered == normalized_question or lowered in previous:
+            continue
+        if text not in followups:
+            followups.append(text)
+
+    for item in execution_log:
+        action_name = str(item.get("action") or "").strip()
+        if action_name == "run_distribution_profile":
+            subset_value = str(item.get("subset_value") or "").strip()
+            subset_column = str(item.get("subset_column") or "").strip()
+            if subset_value and subset_column:
+                suggestion = f"Comment se distinguent les profils au sein du groupe '{subset_value}' pour la variable '{subset_column}' ?"
+                if (
+                    "rerun_profils_y_for_segment" not in recent_actions
+                    and _canonical_question(suggestion) not in previous
+                    and suggestion not in followups
+                ):
+                    followups.append(suggestion)
+        elif action_name == "rerun_profils_y_for_segment":
+            subset_value = str(item.get("subset_value") or "").strip()
+            subset_column = str(item.get("subset_column") or "").strip()
+            if subset_value and subset_column:
+                suggestion = f"Souhaitez-vous comparer le groupe '{subset_value}' ({subset_column}) à une autre variable de l'étude ?"
+                if _canonical_question(suggestion) not in previous and suggestion not in followups:
+                    followups.append(suggestion)
+                suggestion = f"Voulez-vous explorer les relations entre '{subset_column}' et une autre variable pour ce groupe ?"
+                if _canonical_question(suggestion) not in previous and suggestion not in followups:
+                    followups.append(suggestion)
+        elif action_name == "analyze_relationships":
+            variables = item.get("available_variables") or item.get("variables") or []
+            if isinstance(variables, list) and len(variables) >= 2:
+                suggestion = f"Souhaitez-vous approfondir la relation entre {variables[0]} et {variables[1]} sur un segment précis ?"
+                if _canonical_question(suggestion) not in previous and suggestion not in followups:
+                    followups.append(suggestion)
+
+    generic_fallbacks = [
+        "Souhaitez-vous approfondir un autre segment précis de la population ?",
+        "Voulez-vous croiser cette analyse avec une autre variable encore non explorée ?",
+        "Souhaitez-vous une lecture plus détaillée d'un autre profil identifié ?",
+    ]
+    for suggestion in generic_fallbacks:
+        if _canonical_question(suggestion) in previous or _canonical_question(suggestion) == normalized_question:
+            continue
+        if suggestion not in followups:
+            followups.append(suggestion)
+
+    return followups[:3]
+
+
+def _clear_qa_force_flags() -> None:
+    st.session_state["__QA_FORCE_CROSSTABS__"] = False
+    st.session_state["__QA_SELECTED_CROSSTAB_PAIRS__"] = []
+    st.session_state["__QA_FORCE_DISTRIBUTIONS__"] = False
+    st.session_state["__QA_SELECTED_DISTRIBUTION_VARS__"] = []
+    st.session_state["__QA_PROFILE_MODE__"] = False
+    st.session_state["__QA_PROFILE_TARGET_VARIABLE__"] = None
+    st.session_state["__QA_PROFILE_TARGET_MODALITY__"] = None
+
+
+def _execute_action_plan(plan: dict[str, Any], df_ready: pd.DataFrame, question: str = "") -> list[dict[str, Any]]:
+    execution_log: list[dict[str, Any]] = []
+    _clear_qa_force_flags()
+
+    action_priority = {
+        "run_preparation1": 1,
+        "run_preparation2": 2,
+        "rerun_sankey": 3,
+        "rerun_profils_y": 4,
+        "rerun_profils_y_for_segment": 5,
+        "contextualize_segment": 6,
+        "run_distribution_profile": 7,
+        "analyze_relationships": 8,
+        "run_crosstabs": 9,
+        "run_distributions": 10,
+    }
+
+    actions = sorted(plan.get("actions", []), key=lambda item: action_priority.get(item.get("action"), 99))
+
+    for action in actions:
+        action_name = action.get("action")
+        result: dict[str, Any] = {"action": action_name, "reason": action.get("reason", "")}
+
+        try:
+            if action_name == "contextualize_segment":
+                subset_info = _resolve_subset_from_question(question, df_ready)
+                if subset_info:
+                    subset_column = str(subset_info.get("column") or "")
+                    subset_value = str(subset_info.get("value") or "")
+                    subset_df = subset_info.get("df")
+                    counts_df, percent_df = build_segment_context_tables(df_ready, subset_column)
+                    segment_count = len(subset_df) if isinstance(subset_df, pd.DataFrame) else 0
+                    total_count = len(df_ready) if isinstance(df_ready, pd.DataFrame) else 0
+                    segment_share = round((segment_count / total_count) * 100, 1) if total_count else 0.0
+                    intro_text = build_segment_intro(subset_column, subset_value, segment_count, segment_share, total_count)
+                    st.session_state["qa_segment_context"] = {
+                        "column": subset_column,
+                        "value": subset_value,
+                        "count": segment_count,
+                        "share": segment_share,
+                        "intro": intro_text,
+                    }
+                    st.session_state["qa_segment_counts_table"] = counts_df
+                    st.session_state["qa_segment_percent_table"] = percent_df
+                    st.session_state["qa_segment_subdataset"] = subset_df
+                    result["status"] = "completed"
+                    result["subset"] = subset_info.get("description")
+                    result["subset_column"] = subset_column
+                    result["subset_value"] = subset_value
+                    result["intro"] = intro_text
+                    result["counts_table"] = counts_df
+                    result["percent_table"] = percent_df
+                else:
+                    result["status"] = "skipped"
+                    result["error"] = "segment non résolu"
+
+            elif action_name == "rerun_sankey":
+                target_variable = action.get("target_variable")
+                if target_variable:
+                    _set_target_variable_for_qa(target_variable)
+                st.session_state["run_sankey_crosstabs"] = True
+                run_diagram_sankey()
+                result["status"] = "completed"
+                result["target_variable"] = target_variable
+                result["produced"] = {
+                    "sankey_interpretation_synthesis": bool(
+                        str(st.session_state.get("sankey_interpretation_synthesis") or "").strip()
+                    ),
+                    "sankey_pair_results": bool(st.session_state.get("sankey_pair_results")),
+                }
+
+            elif action_name == "rerun_profils_y":
+                target_variable = action.get("target_variable")
+                target_modality = action.get("target_modality")
+                if target_variable:
+                    _set_target_variable_for_qa(target_variable)
+                if target_variable and target_modality:
+                    _set_target_modality_for_qa(target_variable, target_modality)
+                st.session_state["__QA_PROFILE_MODE__"] = True
+                st.session_state["__QA_PROFILE_TARGET_VARIABLE__"] = target_variable
+                st.session_state["__QA_PROFILE_TARGET_MODALITY__"] = target_modality
+                st.session_state["_selected_cols"] = None
+                st.session_state["_sig_step2"] = None
+                st.session_state["step3_ready"] = False
+                st.session_state["step5_ready"] = False
+                run_profils_y()
+                result["status"] = "completed"
+                result["target_variable"] = target_variable
+                result["target_modality"] = target_modality
+                result["produced"] = {
+                    "profils_y_text": bool(str(st.session_state.get("profils_y_text") or "").strip()),
+                }
+                st.session_state["__QA_PROFILE_MODE__"] = False
+                st.session_state["__QA_PROFILE_TARGET_VARIABLE__"] = None
+                st.session_state["__QA_PROFILE_TARGET_MODALITY__"] = None
+
+            elif action_name == "rerun_profils_y_for_segment":
+                subset_info = _resolve_subset_from_question(question, df_ready)
+                if not subset_info:
+                    result["status"] = "skipped"
+                    result["error"] = "segment non rÃ©solu"
+                else:
+                    source_column = str(subset_info.get("column") or "")
+                    source_value = str(subset_info.get("value") or "")
+                    temp_df, derived_target, derived_modality = _build_segment_binary_target(df_ready, source_column, source_value)
+                    original_df_ready = st.session_state.get("df_ready")
+                    original_target_variables = list(st.session_state.get("target_variables", []) or [])
+                    original_brief_target = st.session_state.get("brief_target_variable")
+                    original_target_modalities = dict(st.session_state.get("target_modalities", {}) or {})
+                    original_profils_y_text = st.session_state.get("profils_y_text")
+                    original_profils_y_simplified = st.session_state.get("profils_y_simplified")
+                    original_profils_y_table = st.session_state.get("profils_y_table")
+
+                    st.session_state["qa_segment_profils_y_text"] = ""
+                    st.session_state["df_ready"] = temp_df
+                    _set_target_variable_for_qa(derived_target)
+                    _set_target_modality_for_qa(derived_target, derived_modality)
+                    st.session_state["__QA_PROFILE_MODE__"] = True
+                    st.session_state["__QA_PROFILE_TARGET_VARIABLE__"] = derived_target
+                    st.session_state["__QA_PROFILE_TARGET_MODALITY__"] = derived_modality
+                    st.session_state["_selected_cols"] = None
+                    st.session_state["_sig_step2"] = None
+                    st.session_state["step3_ready"] = False
+                    st.session_state["step5_ready"] = False
+
+                    run_profils_y()
+
+                    st.session_state["qa_segment_profils_y_text"] = _rewrite_segment_profils_text(
+                        str(st.session_state.get("profils_y_text") or "").strip(),
+                        source_column,
+                        source_value,
+                    )
+                    st.session_state["df_ready"] = original_df_ready
+                    st.session_state["target_variables"] = original_target_variables
+                    st.session_state["brief_target_variable"] = original_brief_target
+                    st.session_state["target_modalities"] = original_target_modalities
+                    st.session_state["profils_y_text"] = original_profils_y_text
+                    st.session_state["profils_y_simplified"] = original_profils_y_simplified
+                    st.session_state["profils_y_table"] = original_profils_y_table
+                    st.session_state["__QA_PROFILE_MODE__"] = False
+                    st.session_state["__QA_PROFILE_TARGET_VARIABLE__"] = None
+                    st.session_state["__QA_PROFILE_TARGET_MODALITY__"] = None
+
+                    result["status"] = "completed"
+                    result["subset"] = subset_info.get("description")
+                    result["subset_column"] = source_column
+                    result["subset_value"] = source_value
+                    result["derived_target"] = derived_target
+                    result["produced"] = {
+                        "qa_segment_profils_y_text": bool(str(st.session_state.get("qa_segment_profils_y_text") or "").strip()),
+                    }
+
+            elif action_name == "analyze_relationships":
+                pairs = [tuple(pair) for pair in (action.get("pairs") or [])]
+                variables = [str(item) for item in (action.get("variables") or [])]
+                st.session_state["qa_relationship_synthesis"] = ""
+                st.session_state["__QA_FORCE_CROSSTABS__"] = True
+                st.session_state["__QA_SELECTED_CROSSTAB_PAIRS__"] = pairs
+                st.session_state["run_sankey_crosstabs"] = True
+                run_crosstabs_detail()
+                st.session_state["__QA_FORCE_DISTRIBUTIONS__"] = True
+                st.session_state["__QA_SELECTED_DISTRIBUTION_VARS__"] = variables
+                st.session_state["generate_distribution_figures"] = True
+                run_distributions_detail()
+                available_pairs = [
+                    list(pair)
+                    for pair in pairs
+                    if _get_crosstab_item(pair[0], pair[1]) is not None
+                ]
+                available_variables = [
+                    variable for variable in variables if _get_distribution_item(variable) is not None
+                ]
+                st.session_state["qa_relationship_synthesis"] = _generate_relationship_synthesis(
+                    question,
+                    available_pairs,
+                    available_variables,
+                )
+                result["status"] = "completed"
+                result["pairs"] = [list(pair) for pair in pairs]
+                result["variables"] = variables
+                result["available_pairs"] = available_pairs
+                result["available_variables"] = available_variables
+                result["relationship_synthesis"] = st.session_state.get("qa_relationship_synthesis", "")
+                st.session_state["__QA_FORCE_CROSSTABS__"] = False
+                st.session_state["__QA_SELECTED_CROSSTAB_PAIRS__"] = []
+                st.session_state["__QA_FORCE_DISTRIBUTIONS__"] = False
+                st.session_state["__QA_SELECTED_DISTRIBUTION_VARS__"] = []
+
+            elif action_name == "run_crosstabs":
+                pairs = [tuple(pair) for pair in (action.get("pairs") or [])]
+                st.session_state["__QA_FORCE_CROSSTABS__"] = True
+                st.session_state["__QA_SELECTED_CROSSTAB_PAIRS__"] = pairs
+                st.session_state["run_sankey_crosstabs"] = True
+                run_crosstabs_detail()
+                result["status"] = "completed"
+                result["pairs"] = [list(pair) for pair in pairs]
+                result["available_pairs"] = [
+                    list(pair)
+                    for pair in pairs
+                    if _get_crosstab_item(pair[0], pair[1]) is not None
+                ]
+                st.session_state["__QA_FORCE_CROSSTABS__"] = False
+                st.session_state["__QA_SELECTED_CROSSTAB_PAIRS__"] = []
+
+            elif action_name == "run_distributions":
+                variables = [str(item) for item in (action.get("variables") or [])]
+                st.session_state["__QA_FORCE_DISTRIBUTIONS__"] = True
+                st.session_state["__QA_SELECTED_DISTRIBUTION_VARS__"] = variables
+                st.session_state["generate_distribution_figures"] = True
+                run_distributions_detail()
+                result["status"] = "completed"
+                result["variables"] = variables
+                result["available_variables"] = [
+                    variable for variable in variables if _get_distribution_item(variable) is not None
+                ]
+                st.session_state["__QA_FORCE_DISTRIBUTIONS__"] = False
+                st.session_state["__QA_SELECTED_DISTRIBUTION_VARS__"] = []
+
+            elif action_name in PROFILE_ACTIONS:
+                subset_info = _resolve_subset_from_question(question, df_ready)
+                original_df_ready = st.session_state.get("df_ready")
+                original_profile_text = st.session_state.get("profil_dominant_analysis")
+                original_segment_profile_text = st.session_state.get("qa_segment_profile_text")
+                original_dominant_continues = st.session_state.get("dominant_continues")
+                original_dominant_discretes = st.session_state.get("dominant_discretes")
+                st.session_state["__QA_SILENT__"] = True
+                st.session_state["__QA_PROFILE_OUTPUT_KEY__"] = "profil_dominant_analysis"
+                if subset_info and isinstance(subset_info.get("df"), pd.DataFrame):
+                    st.session_state["qa_segment_profile_text"] = ""
+                    st.session_state["__QA_SEGMENT_DF__"] = subset_info["df"]
+                    st.session_state["__QA_PROFILE_OUTPUT_KEY__"] = "qa_segment_profile_text"
+                    st.session_state["qa_last_subset_description"] = subset_info.get("description")
+                    st.session_state["qa_segment_subdataset"] = subset_info.get("df")
+                PROFILE_ACTIONS[action_name]()
+                st.session_state["__QA_SILENT__"] = False
+                st.session_state.pop("__QA_SEGMENT_DF__", None)
+                st.session_state.pop("__QA_PROFILE_OUTPUT_KEY__", None)
+                if original_df_ready is not None:
+                    st.session_state["df_ready"] = original_df_ready
+                st.session_state["dominant_continues"] = original_dominant_continues
+                st.session_state["dominant_discretes"] = original_dominant_discretes
+                result["status"] = "completed"
+                result["produced"] = {
+                    "profil_dominant_analysis": bool(str(st.session_state.get("profil_dominant_analysis") or "").strip()),
+                    "qa_segment_profile_text": bool(str(st.session_state.get("qa_segment_profile_text") or "").strip()),
+                }
+                if subset_info:
+                    result["subset"] = subset_info.get("description")
+                    result["subset_column"] = subset_info.get("column")
+                    result["subset_value"] = subset_info.get("value")
+                    result["profile_output_key"] = "qa_segment_profile_text"
+                    if not str(st.session_state.get("qa_segment_profile_text") or "").strip():
+                        st.session_state["qa_segment_profile_text"] = str(original_segment_profile_text or "")
+                elif original_profile_text != st.session_state.get("profil_dominant_analysis"):
+                    result["subset"] = "population complète"
+
+            elif action_name in PREPARATION_ACTIONS:
+                PREPARATION_ACTIONS[action_name]()
+                result["status"] = "completed"
+                result["produced"] = {
+                    "data_preparation_synthesis": bool(
+                        str(st.session_state.get("data_preparation_synthesis") or "").strip()
+                    ),
+                    "process": bool(st.session_state.get("process") is not None),
+                }
+            else:
+                result["status"] = "skipped"
+                result["error"] = "action non prise en charge"
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = str(exc)
+
+        execution_log.append(result)
+
+    _clear_qa_force_flags()
+    st.session_state["qa_last_execution_log"] = execution_log
+    return execution_log
+
+
+def _build_final_answer_payload(question: str, execution_log: list[dict[str, Any]], df_ready: pd.DataFrame) -> dict[str, Any]:
+    payload = _build_question_payload(question, df_ready)
+    payload["execution_log"] = execution_log
+    payload["brief_analysis_plan"] = st.session_state.get("brief_analysis_plan", [])
+    payload["profils_y_text"] = st.session_state.get("profils_y_text", "")
+    payload["qa_segment_context"] = st.session_state.get("qa_segment_context")
+    payload["qa_segment_profile_text"] = st.session_state.get("qa_segment_profile_text", "")
+    payload["qa_relationship_synthesis"] = st.session_state.get("qa_relationship_synthesis", "")
+    if any(str(item.get("action") or "").strip() == "rerun_profils_y_for_segment" for item in execution_log):
+        payload.pop("qa_segment_profils_y_text", None)
+        payload["qa_segment_profils_y_available"] = bool(
+            str(st.session_state.get("qa_segment_profils_y_text") or "").strip()
+        )
+    else:
+        payload["qa_segment_profils_y_text"] = st.session_state.get("qa_segment_profils_y_text", "")
+    payload["process_text"] = to_text(st.session_state.get("process")) if st.session_state.get("process") is not None else ""
+    return payload
+
+
+def _build_existing_analysis_digest(exclude_sources: set[str] | None = None) -> list[dict[str, str]]:
+    digest: list[dict[str, str]] = []
+    excluded = exclude_sources or set()
+    for key, label in [
+        ("global_synthesis", "Synthèse globale"),
+        ("data_preparation_synthesis", "Préparation des données"),
+        ("sankey_interpretation_synthesis", "Relations principales"),
+        ("latent_summary_text", "Dimensions latentes"),
+        ("qa_relationship_synthesis", "Synthèse des relations"),
+        ("qa_segment_profile_text", "Profil dominant du segment"),
+        ("qa_segment_profils_y_text", "Profils dÃ©taillÃ©s du segment"),
+        ("profil_dominant_analysis", "Profil dominant"),
+        ("profils_y_text", "Profils détaillés"),
+    ]:
+        if key in excluded:
+            continue
+        text = str(st.session_state.get(key) or "").strip()
+        if text:
+            digest.append({"source": key, "label": label, "text": text[:4000]})
+    return digest
+
+
+def _normalize_followup_questions(parsed: dict[str, Any]) -> list[str]:
+    questions: list[str] = []
+    raw_list = parsed.get("followup_questions")
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            text = str(item or "").strip()
+            if text and text not in questions:
+                questions.append(text)
+    single = str(parsed.get("followup_question") or "").strip()
+    if single and single not in questions:
+        questions.insert(0, single)
+    return questions[:3]
+
+
+def _generate_final_answer(question: str, execution_log: list[dict[str, Any]], df_ready: pd.DataFrame) -> dict[str, str]:
+    payload = _build_final_answer_payload(question, execution_log, df_ready)
+    excluded_sources: set[str] = set()
+    if any(str(item.get("action") or "").strip() == "rerun_profils_y_for_segment" for item in execution_log):
+        excluded_sources.add("qa_segment_profils_y_text")
+    payload["existing_analysis_digest"] = _build_existing_analysis_digest(excluded_sources)
+    payload["used_existing_only"] = not bool(execution_log)
+
+    if payload["used_existing_only"] and payload["existing_analysis_digest"]:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Tu rédiges une réponse Q&A à partir d'analyses déjà produites. "
+                        'Réponds uniquement par un JSON strict {"intro":"...","answer":"...","followup_questions":["..."]} '
+                        "en t'appuyant d'abord sur existing_analysis_digest. "
+                        "N'invente rien au-delà des synthèses fournies."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "question": question,
+                            "existing_analysis_digest": payload["existing_analysis_digest"],
+                            "qa_segment_context": payload.get("qa_segment_context"),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ],
+        )
+        raw_answer = response.choices[0].message.content or ""
+        parsed = _safe_json_loads(raw_answer) or {}
+        followup_questions = _build_adaptive_followups(
+            question,
+            execution_log,
+            _normalize_followup_questions(parsed),
+        )
+        return {
+            "intro": str(parsed.get("intro") or "").strip(),
+            "answer": str(parsed.get("answer") or "").strip(),
+            "followup_question": followup_questions[0] if followup_questions else "",
+            "followup_questions": followup_questions,
+            "raw_answer": raw_answer,
+        }
+
+    sys_prompt = """Tu rédiges la réponse finale visible par l'utilisateur.
+Réponds uniquement par un JSON strict {"intro":"...","answer":"...","followup_questions":["..."]}.
+
+Règles :
+- "intro" doit contenir 1 à 3 phrases maximum pour contextualiser la réponse.
+- "answer" doit répondre clairement à la question en t'appuyant sur les analyses disponibles.
+- "followup_questions" doit proposer 2 ou 3 questions de relance utiles, concrètes et cohérentes avec l'historique Q&A.
+- N'écris jamais "les artefacts sont suffisants", "notes LLM", "plan JSON", "outil", "capability" ou tout jargon interne.
+- Si une analyse complémentaire a été exécutée, tu peux le mentionner simplement en langage métier.
+- Si l'information manque encore, dis-le franchement et précise la limite sans inventer.
+- Réponds en français clair et concis.
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+        ],
+    )
+    raw_answer = response.choices[0].message.content or ""
+    parsed = _safe_json_loads(raw_answer) or {}
+    followup_questions = _build_adaptive_followups(
+        question,
+        execution_log,
+        _normalize_followup_questions(parsed),
+    )
+    return {
+        "intro": str(parsed.get("intro") or "").strip(),
+        "answer": str(parsed.get("answer") or "").strip(),
+        "followup_question": followup_questions[0] if followup_questions else "",
+        "followup_questions": followup_questions,
+        "raw_answer": raw_answer,
+    }
+
+def _render_selected_outputs_legacy(execution_log: list[dict[str, Any]]) -> None:
+    for item in execution_log:
+        action_name = item.get("action")
+
+        if action_name == "contextualize_segment":
+            intro = str(item.get("intro") or "").strip()
+            counts_table = item.get("counts_table")
+            percent_table = item.get("percent_table")
+            if intro:
+                st.write(intro)
+            if isinstance(counts_table, pd.DataFrame) and not counts_table.empty:
+                st.markdown("**Effectifs par modalité**")
+                st.dataframe(counts_table, use_container_width=True, hide_index=True)
+            if isinstance(percent_table, pd.DataFrame) and not percent_table.empty:
+                st.markdown("**Pourcentages par modalité**")
+                st.dataframe(percent_table, use_container_width=True, hide_index=True)
+
+        elif action_name == "analyze_relationships":
+            synthesis = str(item.get("relationship_synthesis") or st.session_state.get("qa_relationship_synthesis") or "").strip()
+            if synthesis:
+                st.write(synthesis)
+            for pair in item.get("available_pairs", []) or []:
+                var_a, var_b = pair[0], pair[1]
+                crosstab_item = _get_crosstab_item(var_a, var_b)
+                if not isinstance(crosstab_item, dict):
+                    continue
+                st.markdown(f"**{var_a} x {var_b}**")
+                ct_count = crosstab_item.get("ct_count")
+                if isinstance(ct_count, pd.DataFrame) and not ct_count.empty:
+                    st.dataframe(ct_count, use_container_width=True)
+                interpretation = str(crosstab_item.get("interpretation") or "").strip()
+                if interpretation:
+                    st.write(interpretation)
+                heatmap_png = crosstab_item.get("heatmap_png")
+                if isinstance(heatmap_png, (bytes, bytearray, memoryview)):
+                    st.image(heatmap_png)
+                caption = str(crosstab_item.get("metrics_caption") or "").strip()
+                if caption:
+                    st.caption(caption)
+            for variable in item.get("available_variables", []) or []:
+                dist_item = _get_distribution_item(variable)
+                if not isinstance(dist_item, dict):
+                    continue
+                st.markdown(f"**Distribution de {variable}**")
+                png = dist_item.get("png")
+                if isinstance(png, (bytes, bytearray, memoryview)):
+                    st.image(png)
+                caption = str(dist_item.get("metrics_caption") or "").strip()
+                if caption:
+                    st.caption(caption)
+
+        elif action_name == "run_crosstabs":
+            for pair in item.get("available_pairs", []) or []:
+                var_a, var_b = pair[0], pair[1]
+                crosstab_item = _get_crosstab_item(var_a, var_b)
+                if not isinstance(crosstab_item, dict):
+                    continue
+                st.markdown(f"**{var_a} x {var_b}**")
+                ct_count = crosstab_item.get("ct_count")
+                if isinstance(ct_count, pd.DataFrame) and not ct_count.empty:
+                    st.dataframe(ct_count, use_container_width=True)
+                interpretation = str(crosstab_item.get("interpretation") or "").strip()
+                if interpretation:
+                    st.write(interpretation)
+                heatmap_png = crosstab_item.get("heatmap_png")
+                if isinstance(heatmap_png, (bytes, bytearray, memoryview)):
+                    st.image(heatmap_png)
+                caption = str(crosstab_item.get("metrics_caption") or "").strip()
+                if caption:
+                    st.caption(caption)
+
+        elif action_name == "run_distributions":
+            for variable in item.get("available_variables", []) or []:
+                dist_item = _get_distribution_item(variable)
+                if not isinstance(dist_item, dict):
+                    continue
+                st.markdown(f"**Distribution de {variable}**")
+                png = dist_item.get("png")
+                if isinstance(png, (bytes, bytearray, memoryview)):
+                    st.image(png)
+                caption = str(dist_item.get("metrics_caption") or "").strip()
+                if caption:
+                    st.caption(caption)
+
+        elif action_name == "run_distribution_profile":
+            dominant_text = str(st.session_state.get("profil_dominant_analysis") or "").strip()
+            subset = str(item.get("subset") or "").strip()
+            if subset:
+                if subset_column and subset_value:
+                    st.write(
+                        f"Pour situer cette catégorie dans l'ensemble du jeu de données, voici la répartition de la variable `{subset_column}`. "
+                        f"La sous-population analysée correspond à `{subset_value}`."
+                    )
+                else:
+                    st.caption(f"Sous-population analysée : {subset}")
+            if isinstance(category_context_df, pd.DataFrame) and not category_context_df.empty:
+                st.dataframe(category_context_df, use_container_width=True, hide_index=True)
+            if dominant_text:
+                st.markdown(dominant_text)
+
+
+def _render_selected_outputs_v2(execution_log: list[dict[str, Any]]) -> None:
+    for item in execution_log:
+        action_name = item.get("action")
+
+        if action_name == "contextualize_segment":
+            intro = str(item.get("intro") or "").strip()
+            counts_table = item.get("counts_table")
+            percent_table = item.get("percent_table")
+            if intro:
+                st.write(intro)
+            if isinstance(counts_table, pd.DataFrame) and not counts_table.empty:
+                st.markdown("**Effectifs par modalité**")
+                st.dataframe(counts_table, use_container_width=True, hide_index=True)
+            if isinstance(percent_table, pd.DataFrame) and not percent_table.empty:
+                st.markdown("**Pourcentages par modalité**")
+                st.dataframe(percent_table, use_container_width=True, hide_index=True)
+            continue
+
+        if action_name == "analyze_relationships":
+            synthesis = str(item.get("relationship_synthesis") or st.session_state.get("qa_relationship_synthesis") or "").strip()
+            if synthesis:
+                st.write(synthesis)
+            for pair in item.get("available_pairs", []) or []:
+                var_a, var_b = pair[0], pair[1]
+                crosstab_item = _get_crosstab_item(var_a, var_b)
+                if not isinstance(crosstab_item, dict):
+                    continue
+                st.markdown(f"**{var_a} x {var_b}**")
+                ct_count = crosstab_item.get("ct_count")
+                if isinstance(ct_count, pd.DataFrame) and not ct_count.empty:
+                    st.dataframe(ct_count, use_container_width=True)
+                interpretation = str(crosstab_item.get("interpretation") or "").strip()
+                if interpretation:
+                    st.write(interpretation)
+                heatmap_png = crosstab_item.get("heatmap_png")
+                if isinstance(heatmap_png, (bytes, bytearray, memoryview)):
+                    st.image(heatmap_png)
+                caption = str(crosstab_item.get("metrics_caption") or "").strip()
+                if caption:
+                    st.caption(caption)
+            for variable in item.get("available_variables", []) or []:
+                dist_item = _get_distribution_item(variable)
+                if not isinstance(dist_item, dict):
+                    continue
+                st.markdown(f"**Distribution de {variable}**")
+                png = dist_item.get("png")
+                if isinstance(png, (bytes, bytearray, memoryview)):
+                    st.image(png)
+                caption = str(dist_item.get("metrics_caption") or "").strip()
+                if caption:
+                    st.caption(caption)
+            continue
+
+        if action_name == "run_crosstabs":
+            for pair in item.get("available_pairs", []) or []:
+                var_a, var_b = pair[0], pair[1]
+                crosstab_item = _get_crosstab_item(var_a, var_b)
+                if not isinstance(crosstab_item, dict):
+                    continue
+                st.markdown(f"**{var_a} x {var_b}**")
+                ct_count = crosstab_item.get("ct_count")
+                if isinstance(ct_count, pd.DataFrame) and not ct_count.empty:
+                    st.dataframe(ct_count, use_container_width=True)
+                interpretation = str(crosstab_item.get("interpretation") or "").strip()
+                if interpretation:
+                    st.write(interpretation)
+                heatmap_png = crosstab_item.get("heatmap_png")
+                if isinstance(heatmap_png, (bytes, bytearray, memoryview)):
+                    st.image(heatmap_png)
+                caption = str(crosstab_item.get("metrics_caption") or "").strip()
+                if caption:
+                    st.caption(caption)
+            continue
+
+        if action_name == "run_distributions":
+            for variable in item.get("available_variables", []) or []:
+                dist_item = _get_distribution_item(variable)
+                if not isinstance(dist_item, dict):
+                    continue
+                st.markdown(f"**Distribution de {variable}**")
+                png = dist_item.get("png")
+                if isinstance(png, (bytes, bytearray, memoryview)):
+                    st.image(png)
+                caption = str(dist_item.get("metrics_caption") or "").strip()
+                if caption:
+                    st.caption(caption)
+            continue
+
+        if action_name == "run_distribution_profile":
+            continue
+
+        if action_name == "rerun_profils_y_for_segment":
+            detailed_text = str(st.session_state.get("qa_segment_profils_y_text") or "").strip()
+            if detailed_text:
+                st.markdown(detailed_text)
+            continue
+
+
+def _extract_used_artifacts(execution_log: list[dict[str, Any]]) -> list[str]:
+    used_artifacts: list[str] = []
+    if str(st.session_state.get("global_synthesis") or "").strip():
+        used_artifacts.append("global_synthesis")
+    if str(st.session_state.get("data_preparation_synthesis") or "").strip():
+        used_artifacts.append("data_preparation_synthesis")
+    if str(st.session_state.get("sankey_interpretation_synthesis") or "").strip():
+        used_artifacts.append("sankey_interpretation_synthesis")
+    if str(st.session_state.get("profils_y_text") or "").strip():
+        used_artifacts.append("profils_y_text")
+    if str(st.session_state.get("qa_segment_profils_y_text") or "").strip():
+        used_artifacts.append("qa_segment_profils_y_text")
+    if str(st.session_state.get("qa_segment_profile_text") or "").strip():
+        used_artifacts.append("qa_segment_profile_text")
+    if str(st.session_state.get("qa_relationship_synthesis") or "").strip():
+        used_artifacts.append("qa_relationship_synthesis")
+    if str(st.session_state.get("profil_dominant_analysis") or "").strip():
+        used_artifacts.append("profil_dominant_analysis")
+    if st.session_state.get("qa_segment_context"):
+        used_artifacts.append("qa_segment_context")
+    if st.session_state.get("crosstabs_interpretation"):
+        used_artifacts.append("crosstabs_interpretation")
+    if st.session_state.get("figs_variables_distribution") or st.session_state.get("figs_variables_distribution_detailed"):
+        used_artifacts.append("distribution_figures")
+    for item in execution_log:
+        action_name = str(item.get("action") or "").strip()
+        if action_name and action_name not in used_artifacts:
+            used_artifacts.append(action_name)
+    return used_artifacts
+
+
+def _render_chat_sequence(history: list[dict[str, Any]], latest_execution_log: list[dict[str, Any]] | None = None) -> None:
+    for idx, item in enumerate(history):
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        intro = str(item.get("intro") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        entry_execution_log = item.get("execution_log") or []
+
+        with st.chat_message("user"):
+            st.write(question)
+
+        with st.chat_message("assistant"):
+            body_parts = [part for part in [intro, answer] if part]
+            if body_parts:
+                st.markdown("\n\n".join(body_parts))
+            if isinstance(entry_execution_log, list) and entry_execution_log:
+                _render_selected_outputs_v2(entry_execution_log)
+            elif idx == len(history) - 1 and isinstance(latest_execution_log, list) and latest_execution_log:
+                _render_selected_outputs_v2(latest_execution_log)
+
+def _maybe_run_brief_agent(df_ready: pd.DataFrame, plan: dict[str, Any]) -> None:
+    if not isinstance(df_ready, pd.DataFrame) or df_ready.empty:
+        return
+    if not plan.get("actions"):
+        return
+    try:
+        run_brief_agent(df_ready)
+    except Exception as exc:
+        st.session_state["qa_last_brief_agent_error"] = str(exc)
+
+
+def _process_qa_question(question: str, df_ready: pd.DataFrame) -> bool:
+    if not question.strip():
+        st.warning("Veuillez poser une question.")
+        return False
+    if not isinstance(df_ready, pd.DataFrame) or df_ready.empty:
+        st.warning("Aucun dataset prêt n'est disponible pour répondre à la question.")
+        return False
+
+    try:
+        effective_question = _expand_followup_reply(question)
+        st.session_state[NAV_CONTEXT_KEY] = "action"
+        st.session_state["__QA_SUBMITTED__"] = True
+        st.session_state["qa_last_question"] = question
+
+        raw_plan = _plan_qa_actions(effective_question, df_ready)
+        plan = _sanitize_plan(raw_plan, effective_question, df_ready)
+        st.session_state["qa_last_plan"] = plan
+
+        _maybe_run_brief_agent(df_ready, plan)
+        execution_log = _execute_action_plan(plan, df_ready, question=effective_question)
+
+        final_answer = _generate_final_answer(effective_question, execution_log, df_ready)
+        st.session_state["qa_last_answer"] = final_answer
+
+        intro = final_answer.get("intro") or "Voici la lecture la plus utile à partir des analyses disponibles."
+        answer = final_answer.get("answer") or "Je n'ai pas pu produire de réponse exploitable à partir des éléments disponibles."
+        followup_questions = final_answer.get("followup_questions") or []
+        if not isinstance(followup_questions, list):
+            followup_questions = []
+        followup_questions = [str(x).strip() for x in followup_questions if str(x).strip()][:3]
+        followup_question = followup_questions[0] if followup_questions else ""
+        st.session_state["qa_last_followup_question"] = followup_question
+        st.session_state[QA_LAST_FOLLOWUPS_KEY] = followup_questions
+
+        append_qa_history(
+            {
+                "question": question,
+                "effective_question": effective_question,
+                "intro": intro,
+                "answer": answer,
+                "followup_question": followup_question,
+                "followup_questions": followup_questions,
+                "execution_log": execution_log,
+                "actions": plan.get("actions", []),
+                "used_artifacts": _extract_used_artifacts(execution_log),
+            }
+        )
+        st.session_state["qa_main_input"] = ""
+        st.session_state["qa_followup_input"] = ""
+        return True
+    except Exception as exc:
+        st.error(f"Erreur lors du traitement de la question : {exc}")
+        return False
+
+def run() -> None:
+    ensure_qa_memory()
+    update_qa_conversation_summary()
+    st.session_state.setdefault(NAV_CONTEXT_KEY, "view")
+    st.session_state.setdefault("qa_last_plan", None)
+    st.session_state.setdefault("qa_last_answer", None)
+    st.session_state.setdefault("qa_last_execution_log", [])
+    st.session_state.setdefault("qa_last_question", "")
+
+    df_ready = st.session_state.get("df_ready")
+
+    st.subheader("Q&A")
+    history = st.session_state.get(QA_HISTORY_KEY, [])
+    last_followups = st.session_state.get(QA_LAST_FOLLOWUPS_KEY) or []
+    last_execution_log = st.session_state.get("qa_last_execution_log", [])
+
+    if isinstance(history, list) and history:
+        _render_chat_sequence(history[-6:], latest_execution_log=last_execution_log)
+        suggested_followups = last_followups if isinstance(last_followups, list) else []
+        suggested_followups = [str(x).strip() for x in suggested_followups if str(x).strip()][:3]
+        if suggested_followups:
+            st.markdown("**Questions suggérées**")
+            suggestion_cols = st.columns(len(suggested_followups))
+            for idx, suggestion in enumerate(suggested_followups):
+                with suggestion_cols[idx]:
+                    if st.button(suggestion, key=f"qa_followup_suggestion_{idx}", use_container_width=True):
+                        if _process_qa_question(suggestion, df_ready):
+                            st.rerun()
+
+    input_col, send_col = st.columns([12, 1])
+    with input_col:
+        submitted_question = st.text_input(
+            "",
+            key="qa_chat_input",
+            placeholder="Posez une question sur le jeu de données",
+            label_visibility="collapsed",
+        )
+    with send_col:
+        submitted = st.button(">", use_container_width=True)
+    if submitted and submitted_question:
+        if _process_qa_question(str(submitted_question).strip(), df_ready):
+            st.rerun()
+
+    reset_qa_col, _spacer_col = st.columns([3, 9])
+    with reset_qa_col:
+        if st.button("Réinitialiser Q&A", use_container_width=True):
+            _reset_qa_history()
+            st.rerun()
 
     st.markdown("##### Actions suivantes")
     back_col, change_col, reset_col = st.columns(3)
@@ -434,7 +1751,6 @@ def run():
             _goto_step("3")
     with change_col:
         if st.button("Changer les objectifs", use_container_width=True):
-            st.session_state["__DG_FORCE_RERUN__"] = True
             st.session_state["pipeline_ready_to_run"] = False
             st.session_state["pipeline_executed"] = False
             st.session_state["pipeline_status"] = None

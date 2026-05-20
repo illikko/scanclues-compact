@@ -11,11 +11,33 @@ from utils import discretize_continuous_variables
 
 MODE_KEY = "__NAV_MODE__"
 
+
+def _in_pipeline_mode() -> bool:
+    return bool(st.session_state.get("__PIPELINE_FORCE_AUTO__", False))
+
+
+def _select_dataset(datasets_disponibles: dict[str, pd.DataFrame]) -> tuple[str, pd.DataFrame]:
+    preferred_labels = [
+        "Toutes les variables",
+        "Variables actives, ordinales encodées",
+        "Toutes les variables, ordinales encodées",
+    ]
+    if _in_pipeline_mode():
+        for label in preferred_labels:
+            if label in datasets_disponibles:
+                return label, datasets_disponibles[label].copy()
+        first_label = next(iter(datasets_disponibles))
+        return first_label, datasets_disponibles[first_label].copy()
+
+    choix = st.selectbox("Choisissez un dataset à utiliser :", list(datasets_disponibles.keys()), index=0)
+    return choix, datasets_disponibles[choix].copy()
+
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 def run():
-    mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
+    pipeline_mode = _in_pipeline_mode()
+    mode = "automatique" if pipeline_mode else st.session_state.get(MODE_KEY, "automatique")
     # Initialisation des états
     if "etape30_terminee" not in st.session_state:
         st.session_state["etape30_terminee"] = False
@@ -74,8 +96,7 @@ def run():
         st.stop()  # empêche la suite du script d'utiliser 'df' inexistant
 
     # Sélection et copie sûre
-    choix = st.selectbox("Choisissez un dataset à utiliser :", list(datasets_disponibles.keys()), index=0)
-    df = datasets_disponibles[choix].copy()
+    choix, df = _select_dataset(datasets_disponibles)
 
     st.success(f"{choix} chargé depuis l'application précédente.")
     st.write("Aperçu du dataset :")
@@ -88,16 +109,20 @@ def run():
     if "step3_validated" not in st.session_state:
         st.session_state.step3_validated = False
 
-    selected_cols = st.multiselect(
-        "Colonnes à garder",
-        df.columns.tolist(),
-        default=df.columns.tolist()
-    )
+    if pipeline_mode:
+        selected_cols = list(df.columns)
+        st.session_state.step3_validated = True
+    else:
+        selected_cols = st.multiselect(
+            "Colonnes à garder",
+            df.columns.tolist(),
+            default=df.columns.tolist()
+        )
 
     # IMPORTANT: on met à jour df en session dès maintenant
     st.session_state.df = df[selected_cols].copy()
 
-    if st.button("Valider la sélection des variables"):
+    if (not pipeline_mode) and st.button("Valider la sélection des variables"):
         st.session_state.step3_validated = True
         st.success("Sélection validée.")
 
@@ -108,7 +133,7 @@ def run():
     st.subheader("Détermination du nombre de segments optimal")
     st.write("Cette étape est optionnelle car elle peut prendre quelques minutes.")
 
-    if st.button("Lancer lâ€™analyse de la méthode du coude"):
+    if (not pipeline_mode) and st.button("Lancer lâ€™analyse de la méthode du coude"):
         with st.spinner("Calcul en cours..."):
             costs = []
             K = range(2, 11)
@@ -137,12 +162,20 @@ def run():
     df = st.session_state.df.copy()
     
     st.markdown("##### Paramètres de la segmentation")
-    model_segmentation = st.selectbox("Modèles de clustering", ["Kmodes", "Kmeans", "CAH", "DBSCAN"], index=0)
-    num_quantiles = st.slider("Nombre de quantiles pour la discrétisation", min_value=3, max_value=10, value=int(st.session_state.get("num_quantiles", 5)))
-    n_clusters = st.slider("Nombre de segments", min_value=2, max_value=20, value=int(st.session_state.get("n_clusters_segmentation", 10)))
-    n_init = st.slider("Nombre d'itérations du Kmode", min_value=2, max_value=10, value=int(st.session_state.get("kmodes_n_init", 2)))
-    high_freq_threshold = st.slider("Fréquence du mode à partir de laquelle la discrétisation est binaire", min_value=0.50, max_value=0.99, value=float(st.session_state.get("high_freq_threshold", 0.90)), step=0.01)
-    distinct_threshold_continuous = st.number_input("Seuil (nb de modalités distinctes) à partir duquel une variable numérique est continue", min_value=2, max_value=20, value=int(st.session_state.get("distinct_threshold_continuous", 5)), step=1)
+    if pipeline_mode:
+        model_segmentation = "Kmodes"
+        num_quantiles = int(st.session_state.get("num_quantiles", 5))
+        n_clusters = int(st.session_state.get("n_clusters_segmentation", 10))
+        n_init = int(st.session_state.get("kmodes_n_init", 2))
+        high_freq_threshold = float(st.session_state.get("high_freq_threshold", 0.90))
+        distinct_threshold_continuous = int(st.session_state.get("distinct_threshold_continuous", 5))
+    else:
+        model_segmentation = st.selectbox("Modèles de clustering", ["Kmodes", "Kmeans", "CAH", "DBSCAN"], index=0)
+        num_quantiles = st.slider("Nombre de quantiles pour la discrétisation", min_value=3, max_value=10, value=int(st.session_state.get("num_quantiles", 5)))
+        n_clusters = st.slider("Nombre de segments", min_value=2, max_value=20, value=int(st.session_state.get("n_clusters_segmentation", 10)))
+        n_init = st.slider("Nombre d'itérations du Kmode", min_value=2, max_value=10, value=int(st.session_state.get("kmodes_n_init", 2)))
+        high_freq_threshold = st.slider("Fréquence du mode à partir de laquelle la discrétisation est binaire", min_value=0.50, max_value=0.99, value=float(st.session_state.get("high_freq_threshold", 0.90)), step=0.01)
+        distinct_threshold_continuous = st.number_input("Seuil (nb de modalités distinctes) à partir duquel une variable numérique est continue", min_value=2, max_value=20, value=int(st.session_state.get("distinct_threshold_continuous", 5)), step=1)
 
     proceed = False
     if mode == "automatique":

@@ -8,8 +8,15 @@ import os
 from utils import discretize_continuous_variables
 
 MODE_KEY = "__NAV_MODE__"
+QA_MODE_KEY = "__QA_PROFILE_MODE__"
+QA_TARGET_VARIABLE_KEY = "__QA_PROFILE_TARGET_VARIABLE__"
+QA_TARGET_MODALITY_KEY = "__QA_PROFILE_TARGET_MODALITY__"
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+def _in_pipeline_mode() -> bool:
+    return bool(st.session_state.get("__PIPELINE_FORCE_AUTO__", False))
 
 # -----------------------------
 # Helpers : reset / préselection
@@ -107,7 +114,10 @@ def _compute_segment_indices(df: pd.DataFrame, tv: str, choice: str) -> list[int
 
 
 def run():
-    mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
+    qa_mode = bool(st.session_state.get(QA_MODE_KEY, False))
+    pipeline_mode = _in_pipeline_mode()
+    context_mode = qa_mode or pipeline_mode
+    mode = "automatique" if context_mode else st.session_state.get(MODE_KEY, "automatique")
     # -----------------------------
     # State init
     # -----------------------------
@@ -134,7 +144,8 @@ def run():
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
-    st.header("Profils associés à une cible")
+    if not qa_mode:
+        st.header("Profils associés à une cible")
 
     # -----------------------------
     # Dataset
@@ -149,120 +160,63 @@ def run():
     # Bouton reset global
     # -----------------------------
 
-    if st.button("Réinitialiser / relancer"):
-        # Reset complet module
-        for k in list(defaults.keys()):
-            st.session_state[k] = defaults[k]
-        st.rerun()
-    st.caption("Changez la cible/mod/paramètres puis cliquez Lancer.")
-
-    st.write("Aperçu du dataset :")
-    st.dataframe(df_base.head())
+    if not qa_mode:
+        if st.button("Réinitialiser / relancer"):
+            for k in list(defaults.keys()):
+                st.session_state[k] = defaults[k]
+            st.rerun()
+        st.caption("Changez la cible/mod/paramètres puis cliquez Lancer.")
+        st.write("Aperçu du dataset :")
+        st.dataframe(df_base.head())
 
     # ==========================================================
     # Étape 2 : paramètres (dans un form => exécuter sur click)
     # ==========================================================
-    st.subheader("Sélection des paramètres")
+    if not qa_mode:
+        st.subheader("Sélection des paramètres")
 
-    with st.form("step2_form", clear_on_submit=False):
-        # Colonnes à garder
+    if context_mode:
         all_cols = df_base.columns.tolist()
-        default_cols = st.session_state["_selected_cols"] or all_cols
-        selected_cols = st.multiselect(
-            "Colonnes à garder",
-            all_cols,
-            default=default_cols
-        )
-
+        selected_cols = all_cols
         if not selected_cols:
             st.warning("Sélectionne au moins une colonne.")
-            submitted = st.form_submit_button("Lancer")
             return
 
         df = df_base[selected_cols].copy()
-
-        # Préselection cible
-        preferred_tv = _get_preferred_target_variable(df)
-        options_tv = df.columns.tolist()
-        default_index_tv = options_tv.index(preferred_tv)
-
-        target_variable = st.selectbox(
-            "Variable cible",
-            options=options_tv,
-            index=default_index_tv
-        )
-
-        # Déterminer continu / cat
+        forced_tv = st.session_state.get(QA_TARGET_VARIABLE_KEY) if qa_mode else None
+        target_variable = forced_tv if forced_tv in df.columns else _get_preferred_target_variable(df)
         distinct_threshold = int(st.session_state.get("distinct_threshold_continuous", 5))
         nunq = df[target_variable].nunique(dropna=True)
         is_cont = is_numeric_dtype(df[target_variable]) and nunq > distinct_threshold
-
-        target_mod = None
         idxs = []
+        target_mod = None
 
         if is_cont:
+            forced_choice = str(st.session_state.get(QA_TARGET_MODALITY_KEY) or "").strip() if qa_mode else ""
             segments = ["Top 20%", "Top 10%", "Top 5%", "Bottom 20%", "Bottom 10%", "Bottom 5%"]
-            default_seg = _continuous_segment_default(target_variable)
-            default_seg_index = segments.index(default_seg) if default_seg in segments else 1
-
-            choice = st.selectbox(
-                "Segment sur la variable continue :",
-                segments,
-                index=default_seg_index
-            )
+            choice = forced_choice if forced_choice in segments else _continuous_segment_default(target_variable)
             idxs = _compute_segment_indices(df, target_variable, choice)
             target_mod = choice
-            
-            # calcul du min et max de la cible
             subset = df.loc[idxs, target_variable]
             st.session_state.min_val_quant = subset.min()
             st.session_state.max_val_quant = subset.max()
-
         else:
             modalities = sorted(df[target_variable].dropna().astype("string").unique().tolist())
             if not modalities:
                 st.error("Aucune modalité non-nulle pour cette variable.")
-                submitted = st.form_submit_button("Lancer")
                 return
-
-            pref_mod = _get_preferred_modality(target_variable, modalities)
-            prefs = st.session_state.get("target_modalities", {}) or {}
-            expected_pref = prefs.get(target_variable, None)
-            if expected_pref is not None and pref_mod is None:
-                st.warning(
-                    f"Modalité cible définie dans Diagnostic non trouvée pour '{target_variable}': "
-                    f"'{expected_pref}'. Vérifiez l'encodage/normalisation de cette colonne."
-                )
-                pref_mod = modalities[0]
-            elif pref_mod is None:
-                # fallback seulement s'il n'y a pas de modalité de référence
-                pref_mod = df[target_variable].astype("string").value_counts(dropna=True).idxmax()
-
-            default_mod_index = modalities.index(str(pref_mod)) if str(pref_mod) in modalities else 0
-
-            target_modality = st.selectbox(
-                "Modalité cible :",
-                options=modalities,
-                index=default_mod_index
-            )
+            forced_modality = str(st.session_state.get(QA_TARGET_MODALITY_KEY) or "").strip() if qa_mode else ""
+            if forced_modality in modalities:
+                target_modality = forced_modality
+            else:
+                pref_mod = _get_preferred_modality(target_variable, modalities)
+                target_modality = pref_mod if pref_mod is not None else df[target_variable].astype("string").value_counts(dropna=True).idxmax()
             idxs = df.index[df[target_variable].astype("string") == str(target_modality)].tolist()
             target_mod = str(target_modality)
 
-        # Autres paramètres
-        num_quantiles = st.slider(
-            "Nombre de quantiles (discrétisation des continues explicatives)",
-            min_value=3, max_value=10,
-            value=int(st.session_state.get("num_quantiles", 5))
-        )
-        n_clusters = st.slider(
-            "Nombre de clusters",
-            min_value=1, max_value=15,
-            value=int(st.session_state.get("n_clusters", 3))
-        )
-
-        n_init = st.slider("Nombre d'itérations du Kmodes", min_value=2, max_value=10, value=5)
-
-        # Signature step2 : si change => reset steps suivants
+        num_quantiles = int(st.session_state.get("num_quantiles", 5))
+        n_clusters = int(st.session_state.get("n_clusters", 3))
+        n_init = int(st.session_state.get("kmodes_n_init", 10))
         sig = (
             tuple(selected_cols),
             target_variable,
@@ -270,10 +224,118 @@ def run():
             int(num_quantiles),
             int(n_clusters),
         )
+        proceed_step2 = True
+    else:
+        with st.form("step2_form", clear_on_submit=False):
+            # Colonnes à garder
+            all_cols = df_base.columns.tolist()
+            default_cols = st.session_state["_selected_cols"] or all_cols
+            selected_cols = st.multiselect(
+                "Colonnes à garder",
+                all_cols,
+                default=default_cols
+            )
 
-        submitted = st.form_submit_button("Lancer")
-        
-    proceed_step2 = (mode == "automatique") or submitted
+            if not selected_cols:
+                st.warning("Sélectionne au moins une colonne.")
+                submitted = st.form_submit_button("Lancer")
+                return
+
+            df = df_base[selected_cols].copy()
+
+            # Préselection cible
+            preferred_tv = _get_preferred_target_variable(df)
+            options_tv = df.columns.tolist()
+            default_index_tv = options_tv.index(preferred_tv)
+
+            target_variable = st.selectbox(
+                "Variable cible",
+                options=options_tv,
+                index=default_index_tv
+            )
+
+            # Déterminer continu / cat
+            distinct_threshold = int(st.session_state.get("distinct_threshold_continuous", 5))
+            nunq = df[target_variable].nunique(dropna=True)
+            is_cont = is_numeric_dtype(df[target_variable]) and nunq > distinct_threshold
+
+            target_mod = None
+            idxs = []
+
+            if is_cont:
+                segments = ["Top 20%", "Top 10%", "Top 5%", "Bottom 20%", "Bottom 10%", "Bottom 5%"]
+                default_seg = _continuous_segment_default(target_variable)
+                default_seg_index = segments.index(default_seg) if default_seg in segments else 1
+
+                choice = st.selectbox(
+                    "Segment sur la variable continue :",
+                    segments,
+                    index=default_seg_index
+                )
+                idxs = _compute_segment_indices(df, target_variable, choice)
+                target_mod = choice
+                
+                # calcul du min et max de la cible
+                subset = df.loc[idxs, target_variable]
+                st.session_state.min_val_quant = subset.min()
+                st.session_state.max_val_quant = subset.max()
+
+            else:
+                modalities = sorted(df[target_variable].dropna().astype("string").unique().tolist())
+                if not modalities:
+                    st.error("Aucune modalité non-nulle pour cette variable.")
+                    submitted = st.form_submit_button("Lancer")
+                    return
+
+                pref_mod = _get_preferred_modality(target_variable, modalities)
+                prefs = st.session_state.get("target_modalities", {}) or {}
+                expected_pref = prefs.get(target_variable, None)
+                if expected_pref is not None and pref_mod is None:
+                    st.warning(
+                        f"Modalité cible définie dans Diagnostic non trouvée pour '{target_variable}': "
+                        f"'{expected_pref}'. Vérifiez l'encodage/normalisation de cette colonne."
+                    )
+                    pref_mod = modalities[0]
+                elif pref_mod is None:
+                    # fallback seulement s'il n'y a pas de modalité de référence
+                    pref_mod = df[target_variable].astype("string").value_counts(dropna=True).idxmax()
+
+                default_mod_index = modalities.index(str(pref_mod)) if str(pref_mod) in modalities else 0
+
+                target_modality = st.selectbox(
+                    "Modalité cible :",
+                    options=modalities,
+                    index=default_mod_index
+                )
+                idxs = df.index[df[target_variable].astype("string") == str(target_modality)].tolist()
+                target_mod = str(target_modality)
+
+            # Autres paramètres
+            num_quantiles = st.slider(
+                "Nombre de quantiles (discrétisation des continues explicatives)",
+                min_value=3, max_value=10,
+                value=int(st.session_state.get("num_quantiles", 5))
+            )
+            n_clusters = st.slider(
+                "Nombre de clusters",
+                min_value=1, max_value=15,
+                value=int(st.session_state.get("n_clusters", 3))
+            )
+
+            n_init = st.slider("Nombre d'itérations du Kmodes", min_value=2, max_value=10, value=5)
+
+            # Signature step2 : si change => reset steps suivants
+            sig = (
+                tuple(selected_cols),
+                target_variable,
+                target_mod,
+                int(num_quantiles),
+                int(n_clusters),
+            )
+
+            submitted = st.form_submit_button("Lancer")
+            
+        proceed_step2 = (mode == "automatique") or submitted
 
     if proceed_step2:
         if st.session_state["_sig_step2"] != sig:
@@ -286,6 +348,7 @@ def run():
         st.session_state.idxs = idxs
         st.session_state.num_quantiles = int(num_quantiles)
         st.session_state.n_clusters = int(n_clusters)
+        st.session_state["kmodes_n_init"] = int(n_init)
 
         # X explicatives
         X = df.drop(columns=[target_variable]).copy()
@@ -296,18 +359,20 @@ def run():
         st.session_state.step5_ready = False
 
     if not st.session_state.step3_ready:
-        st.info("Choisis les paramètres puis clique **Lancer**.")
+        if not qa_mode:
+            st.info("Choisis les paramètres puis clique **Lancer**.")
         return
 
     # ==========================================================
     # Étape 3 : Profils associés à la cible (KModes)
     # ==========================================================
-    st.subheader("Profils associés à la cible")
+    if not qa_mode:
+        st.subheader("Profils associés à la cible")
     min_val_quant = st.session_state.get("min_val_quant", None)
     max_val_quant = st.session_state.get("max_val_quant", None)
 
 
-    if min_val_quant is not None and max_val_quant is not None:
+    if not qa_mode and min_val_quant is not None and max_val_quant is not None:
         st.write(f"Intervalle effectif de la variable cible : {st.session_state.target_variable} | intervalle visé : {st.session_state.target_mod}")
         st.write("Min :", min_val_quant)
         st.write("Max :", max_val_quant)
@@ -327,8 +392,9 @@ def run():
         context_name="profils_y",
     )
 
-    st.caption("Aperçu des variables explicatives après discrétisation :")
-    st.dataframe(Xw.head())
+    if not qa_mode:
+        st.caption("Aperçu des variables explicatives après discrétisation :")
+        st.dataframe(Xw.head())
 
 
     n_clusters = int(st.session_state.n_clusters)
@@ -340,7 +406,12 @@ def run():
         st.warning("Segment cible vide après filtrage. Relance avec un autre segment.")
         return
 
-    km = KModes(n_clusters=n_clusters, init="Huang", n_init=10, random_state=42)
+    km = KModes(
+        n_clusters=n_clusters,
+        init="Huang",
+        n_init=int(st.session_state.get("kmodes_n_init", 10)),
+        random_state=42,
+    )
     clusters = km.fit_predict(target_X)
     target_X["Cluster_id"] = clusters
 
@@ -365,27 +436,30 @@ def run():
     P = P.sort_values(by="Differenciation", ascending=True)
     st.session_state.profils_y_table = P.copy()
 
-    st.subheader("Tableau des profils")
-    st.dataframe(st.session_state.profils_y_table)
+    if not qa_mode:
+        st.subheader("Tableau des profils")
+        st.dataframe(st.session_state.profils_y_table)
 
     # Effectifs + fréquences (SUR LE SEGMENT CIBLE)
     effectifs = target_X["Cluster"].value_counts().sort_index()
     frequences_target = (effectifs / len(target_X) * 100).round(1).astype(str) + "%"
     frequences_total = (effectifs / len(df) * 100).round(1).astype(str) + "%"
 
-    st.subheader("Effectifs & fréquences des profils du segment cible")
-    st.dataframe(
-        pd.DataFrame({"Effectifs": effectifs, "Fréquence / cible": frequences_target, "Fréquence / pop totale": frequences_total})
-    )
-    st.caption(
-        f"Segment cible : {st.session_state.target_variable} → {st.session_state.target_mod} | "
-        f"Taille segment = {len(target_X)} lignes"
-    )
+    if not qa_mode:
+        st.subheader("Effectifs & fréquences des profils du segment cible")
+        st.dataframe(
+            pd.DataFrame({"Effectifs": effectifs, "Fréquence / cible": frequences_target, "Fréquence / pop totale": frequences_total})
+        )
+        st.caption(
+            f"Segment cible : {st.session_state.target_variable} → {st.session_state.target_mod} | "
+            f"Taille segment = {len(target_X)} lignes"
+        )
 
     # ==========================================================
     # Étape 4 : Caractérisation (test value) + profils_y
     # ==========================================================
-    st.subheader("Profils détaillés")
+    if not qa_mode:
+        st.subheader("Profils détaillés")
 
     def group_characterization(data, overall_data, group_column, variables, label_map=None):
         results = []
@@ -431,18 +505,26 @@ def run():
     )
 
     # Seuil test-value
-    st.markdown("##### Paramètre de filtrage des attributs")
-    tv_min = st.slider("Seuil minimum TestValue", 0.0, 5.0, 2.0, 0.5)
+    if not qa_mode:
+        st.markdown("##### Paramètre de filtrage des attributs")
+        tv_min = st.slider("Seuil minimum TestValue", 0.0, 5.0, 2.0, 0.5)
+    else:
+        tv_min = float(st.session_state.get("__QA_PROFILE_TV_MIN__", 2.0))
     characterization_group_y = characterization_group_y[characterization_group_y["TestValue"] >= float(tv_min)]
     characterization_group_y = characterization_group_y.drop(columns=["Cluster_id"])
 
-    st.markdown("##### Caractérisation des groupes (par TestValue)")
+    if not qa_mode:
+        st.markdown("##### Caractérisation des groupes (par TestValue)")
     profils_y_detailed = characterization_group_y.copy()
     st.session_state.profils_y_detailed = profils_y_detailed
-    st.dataframe(st.session_state.profils_y_detailed)
+    if not qa_mode:
+        st.dataframe(st.session_state.profils_y_detailed)
 
     # Dominant/rare
-    threshold = st.slider("Seuil fréquence discriminant attributs dominants/rares)", 0.0, 0.40, 0.10, 0.05)
+    if not qa_mode:
+        threshold = st.slider("Seuil fréquence discriminant attributs dominants/rares)", 0.0, 0.40, 0.10, 0.05)
+    else:
+        threshold = float(st.session_state.get("__QA_PROFILE_FREQ_THRESHOLD__", 0.10))
     profils_y_simplified = profils_y_detailed.copy()
     profils_y_simplified["Importance de l'attribut"] = np.where(
         profils_y_simplified["Group frequency"] > float(threshold), "dominant", "rare"
@@ -450,19 +532,21 @@ def run():
     profils_y_simplified = profils_y_simplified.drop(columns=["Group frequency", "Overall frequency", "TestValue"])
     st.session_state.profils_y_simplified = profils_y_simplified
 
-    st.markdown("##### profils simplifiés pour le LLM")
-    st.dataframe(st.session_state.profils_y_simplified)
+    if not qa_mode:
+        st.markdown("##### profils simplifiés pour le LLM")
+        st.dataframe(st.session_state.profils_y_simplified)
 
     # ==========================================================
     # Étape 5 : Génération LLM (bouton)
     # ==========================================================
-    st.subheader("Génération des profils")
-    st.write("Utilisation de LLM pour générer des noms de profils et des justifications basées sur les attributs dominants/rares.")
+    if not qa_mode:
+        st.subheader("Génération des profils")
+        st.write("Utilisation de LLM pour générer des noms de profils et des justifications basées sur les attributs dominants/rares.")
 
     proceed = False
     if mode == "automatique":
         proceed = True
-    else:
+    elif not qa_mode:
         if st.button("Générer les noms de profils"):
             proceed = True
     
@@ -531,9 +615,10 @@ def run():
         except Exception as e:
             st.error(f"Erreur d'appel à l'API OpenAI : {e}")
 
-    if st.session_state.profils_y_text:
+    if (not qa_mode) and st.session_state.profils_y_text:
         st.markdown(f"##### Profils du segment cible ({st.session_state.target_variable}, {st.session_state.target_mod})")
         st.text_area("Résultat", st.session_state.profils_y_text, height=350)
 
     st.session_state["etape31_terminee"] = True
-    st.success("Étape terminée. Tu peux relancer avec d'autres paramètres ou passer au suivant.")
+    if not qa_mode:
+        st.success("Étape terminée. Tu peux relancer avec d'autres paramètres ou passer au suivant.")

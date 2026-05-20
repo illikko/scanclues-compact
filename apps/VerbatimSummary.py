@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 from core.df_registry import DFState, get_df, set_df
+from core.preparation_diagnostics import remove_preparation_diagnostic, set_preparation_diagnostic
 from utils import preparation_process
 
 # ========= OpenAI =========
@@ -24,6 +25,7 @@ def run_diagnostic_only():
         st.session_state["has_verbatim_candidates"] = False
         st.session_state["verbatim_candidates"] = []
         st.session_state["verbatim_details"] = {}
+        remove_preparation_diagnostic("verbatim_summary")
         return
     df = df_src.copy()
     min_avg_len = 30
@@ -34,8 +36,10 @@ def run_diagnostic_only():
         st.session_state["has_verbatim_candidates"] = False
         st.session_state["verbatim_candidates"] = []
         st.session_state["verbatim_details"] = {}
+        remove_preparation_diagnostic("verbatim_summary")
         return
-    candidates, details = detect_long_text_columns(df, min_avg_len=min_avg_len, min_unique_ratio=min_unique_ratio)
+    diagnostic, details = diagnose_verbatim_columns(df, min_avg_len=min_avg_len, min_unique_ratio=min_unique_ratio)
+    candidates = diagnostic["details"]["columns"]
     st.session_state["has_verbatim_candidates"] = bool(candidates)
     st.session_state["verbatim_candidates"] = candidates
     st.session_state["verbatim_details"] = details
@@ -80,18 +84,80 @@ def detect_long_text_columns(
             continue
 
         avg_len = s_ne.str.len().mean()
+        avg_word_count = s_ne.str.count(r"\S+").mean()
         fp = s_ne.map(_fingerprint)
         unique_ratio = fp.nunique(dropna=False) / n
-        is_candidate = (avg_len > min_avg_len) and (unique_ratio >= min_unique_ratio)
+        has_sentence_shape = bool(avg_len >= 80 or avg_word_count >= 4)
+        is_candidate = (avg_len > min_avg_len) and (unique_ratio >= min_unique_ratio) and has_sentence_shape
         if is_candidate:
             candidates.append(col)
 
         details[col] = {
             "n_non_empty": int(n),
             "avg_len": float(avg_len),
+            "avg_word_count": float(avg_word_count),
             "unique_ratio": float(unique_ratio),
         }
     return candidates, details
+
+
+def diagnose_verbatim_columns(
+    df: pd.DataFrame,
+    *,
+    min_avg_len: int = 30,
+    min_unique_ratio: float = 0.7,
+) -> tuple[dict, dict]:
+    candidates, details = detect_long_text_columns(
+        df,
+        min_avg_len=min_avg_len,
+        min_unique_ratio=min_unique_ratio,
+    )
+    semantic_df = st.session_state.get("df_semantic_types")
+    excluded_semantic_types = {
+        "identifier",
+        "date",
+        "datetime",
+        "time",
+        "latitude",
+        "longitude",
+        "geo_point",
+        "postal_code",
+        "zip_code",
+        "city_name",
+        "region_name",
+        "country_name",
+        "boolean",
+    }
+    if isinstance(semantic_df, pd.DataFrame) and {"name", "semantic_type"} <= set(semantic_df.columns):
+        semantic_map = {
+            str(row["name"]): str(row["semantic_type"]).strip().lower()
+            for _, row in semantic_df.iterrows()
+        }
+        candidates = [
+            col for col in candidates
+            if semantic_map.get(str(col), "") not in excluded_semantic_types
+        ]
+    diagnostic = {
+        "id": "verbatim_summary",
+        "label": "Synthèse des verbatims",
+        "needed": bool(candidates),
+        "reason": (
+            f"{len(candidates)} colonne(s) texte détectée(s)"
+            if candidates
+            else "Aucun verbatim détecté"
+        ),
+        "details": {
+            "columns": [str(col) for col in candidates],
+            "detection": details,
+            "min_avg_len": int(min_avg_len),
+            "min_unique_ratio": float(min_unique_ratio),
+        },
+        "compute_module": "VerbatimSummary",
+        "render_module": "VerbatimSummary",
+        "available": True,
+    }
+    set_preparation_diagnostic(diagnostic)
+    return diagnostic, details
 
 # ========= Comptage & concat =========
 def count_words_chars(text: str):
@@ -132,6 +198,7 @@ def run_diagnostic_only():
         st.session_state["has_verbatim_candidates"] = False
         st.session_state["verbatim_candidates"] = []
         st.session_state["verbatim_details"] = {}
+        remove_preparation_diagnostic("verbatim_summary")
         return
 
     df = df_src.copy()
@@ -144,9 +211,11 @@ def run_diagnostic_only():
         st.session_state["has_verbatim_candidates"] = False
         st.session_state["verbatim_candidates"] = []
         st.session_state["verbatim_details"] = {}
+        remove_preparation_diagnostic("verbatim_summary")
         return
 
-    candidates, details = detect_long_text_columns(df, min_avg_len=min_avg_len, min_unique_ratio=min_unique_ratio)
+    diagnostic, details = diagnose_verbatim_columns(df, min_avg_len=min_avg_len, min_unique_ratio=min_unique_ratio)
+    candidates = diagnostic["details"]["columns"]
     st.session_state["has_verbatim_candidates"] = bool(candidates)
     st.session_state["verbatim_candidates"] = candidates
     st.session_state["verbatim_details"] = details
@@ -197,6 +266,7 @@ def run():
             st.info("Aucun verbatim détecté. Module ignoré.")
             set_df(DFState.VERBATIM_READY, df, step_name="VerbatimSummary/no-op-fast")
             st.session_state["etape3_terminee"] = True
+            remove_preparation_diagnostic("verbatim_summary")
             return
         goto_selection = True
     else:
@@ -212,8 +282,14 @@ def run():
             st.session_state["has_verbatim_candidates"] = False
             st.session_state["verbatim_candidates"] = []
             st.session_state["verbatim_details"] = {}
+            remove_preparation_diagnostic("verbatim_summary")
             return
-        candidates, details = detect_long_text_columns(df, min_avg_len=min_avg_len, min_unique_ratio=MIN_UNIQUE_RATIO)
+        diagnostic, details = diagnose_verbatim_columns(
+            df,
+            min_avg_len=min_avg_len,
+            min_unique_ratio=MIN_UNIQUE_RATIO,
+        )
+        candidates = diagnostic["details"]["columns"]
         st.session_state["has_verbatim_candidates"] = bool(candidates)
         st.session_state["verbatim_candidates"] = candidates
         st.session_state["verbatim_details"] = details
@@ -348,6 +424,7 @@ def run():
             df_ex_verbatim = df.drop(selected_cols, axis=1)
             st.subheader("Jeux de donnnées après élimination des colonnes de verbatims")
             set_df(DFState.VERBATIM_READY, df_ex_verbatim, step_name="VerbatimSummary")
+            preparation_process(df_ex_verbatim, f"{len(selected_cols)} colonne(s) de verbatims synthétisée(s) puis retirée(s).")
             st.dataframe(df_ex_verbatim, use_container_width=True)
             st.session_state["etape3_terminee"] = True
 

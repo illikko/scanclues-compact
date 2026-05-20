@@ -8,6 +8,9 @@ from collections import Counter
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple, Dict, Any
 
+from core.df_registry import DFState, set_df
+from core.preparation_diagnostics import remove_preparation_diagnostic, set_preparation_diagnostic
+from utils import preparation_process
 
 MODE_KEY = "__NAV_MODE__"
 
@@ -268,6 +271,34 @@ def detect_multimodal_config(
     )
 
     return secondary
+
+
+def diagnose_multimodal_responses(
+    df: pd.DataFrame,
+    params: Optional[MultiModalParams] = None,
+) -> dict:
+    det = detect_multimodal_config(df, params=params)
+    diagnostic = {
+        "id": "multiple_responses",
+        "label": "Traiter les réponses multiples",
+        "needed": bool(det.ok),
+        "reason": (
+            f"{len(det.columns)} colonne(s) détectée(s), séparateur '{det.sep}'"
+            if det.ok
+            else "Aucune configuration de réponses multiples détectée"
+        ),
+        "details": {
+            "separator": det.sep,
+            "columns": list(det.columns),
+            "score": float(det.score),
+            "reasons": det.reasons,
+        },
+        "compute_module": "ReponsesMultiples",
+        "render_module": "ReponsesMultiples",
+        "available": True,
+    }
+    set_preparation_diagnostic(diagnostic)
+    return diagnostic
 
 
 def _slugify(s: str) -> str:
@@ -549,6 +580,7 @@ def run():
         df = st.session_state.df_ex_ordonnees.copy()
     else:
         st.warning("Aucun dataset trouvé. Veuillez d'abord passer par l'application précédente.")
+        remove_preparation_diagnostic("multiple_responses")
         st.stop()
 
     st.success("Fichier chargé.")
@@ -574,6 +606,7 @@ def run():
         st.session_state["rm_has_multimodal"] = bool(det.ok)
         st.session_state["rm_detected_sep"] = det.sep
         st.session_state["rm_detected_cols"] = det.columns
+    diagnose_multimodal_responses(df, params=params)
 
     default_sep = det.sep if det.ok else (params.candidate_seps[0] if params.candidate_seps else "+")
     default_cols = det.columns if det.ok else []
@@ -644,6 +677,7 @@ def run():
     if not cols_to_encode:
         st.info("Aucune colonne à réponses multiples sélectionnée.")
         st.session_state.df_ex_multiples = df
+        set_df(DFState.MULTI_DONE, df, step_name="ReponsesMultiples/no-op")
         st.session_state["etape6_terminee"] = True
         return
 
@@ -660,7 +694,12 @@ def run():
         df_final = encode_multiple_columns(df, cols_to_encode, sep=sep, dtype="int8")
 
         st.session_state.df_ex_multiples = df_final
+        set_df(DFState.MULTI_DONE, df_final, step_name="ReponsesMultiples")
         st.session_state["etape6_terminee"] = True
+        preparation_process(
+            df_final,
+            f"{len(cols_to_encode)} colonne(s) de réponses multiples encodée(s) avec le séparateur '{sep}'.",
+        )
 
         st.success("Encodage terminé : colonnes encodées ajoutées et colonnes originales supprimées.")
         st.dataframe(df_final.head(), use_container_width=True)

@@ -6,6 +6,8 @@ import json
 from typing import Dict, Tuple
 
 from core.df_registry import DFState, set_df
+from core.preparation_details import refresh_preparation_details_payload
+from core.preparation_diagnostics import remove_preparation_diagnostic, set_preparation_diagnostic
 from utils import preparation_process
 
 
@@ -13,6 +15,18 @@ MODE_KEY = "__NAV_MODE__"  # toujours lu depuis la main app
 
 # Client OpenAI (clé lue depuis la variable d'environnement OPENAI_API_KEY)
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+def has_uploaded_dataset() -> bool:
+    return isinstance(st.session_state.get("df"), pd.DataFrame)
+
+
+def init_preparation_state() -> None:
+    st.session_state.setdefault("etape1_terminee", False)
+    st.session_state.setdefault("__UPLOAD_NONCE__", 0)
+    st.session_state.setdefault("df", None)
+    st.session_state.setdefault("variables_list_validated", False)
+    st.session_state.setdefault("df_selected", None)
 
 
 # ----------- Helpers LLM : préparation de l'input ----------- #
@@ -215,110 +229,116 @@ def infer_types_with_llm(
     return forced_types, df_semantic
 
 
+def diagnose_semantic_types(
+    df_semantic: pd.DataFrame | None,
+    df_source: pd.DataFrame | None = None,
+) -> list[dict]:
+    if not isinstance(df_semantic, pd.DataFrame) or df_semantic.empty:
+        return []
+
+    semantic_df = df_semantic.copy()
+    for col in ["name", "semantic_type", "format", "base_dtype", "issues"]:
+        if col not in semantic_df.columns:
+            semantic_df[col] = None
+
+    semantic_df["name"] = semantic_df["name"].astype(str)
+    semantic_df["semantic_type"] = semantic_df["semantic_type"].fillna("").astype(str).str.lower()
+
+    specs = [
+        (
+            "semantic_dates",
+            "Colonnes de dates détectées",
+            {"date", "datetime", "time"},
+            False,
+        ),
+        (
+            "semantic_geo",
+            "Colonnes géographiques détectées",
+            {"latitude", "longitude", "geo_point", "postal_code", "zip_code", "city_name", "region_name", "country_name"},
+            False,
+        ),
+        (
+            "semantic_identifiers",
+            "Colonnes identifiants détectées",
+            {"identifier"},
+            False,
+        ),
+        (
+            "semantic_verbatim",
+            "Colonnes de verbatims détectées",
+            {"long_text"},
+            True,
+        ),
+    ]
+
+    diagnostics: list[dict] = []
+    for diag_id, label, semantic_types, available in specs:
+        subset = semantic_df[semantic_df["semantic_type"].isin(semantic_types)].copy()
+        if diag_id == "semantic_verbatim" and isinstance(df_source, pd.DataFrame) and not df_source.empty:
+            from .VerbatimSummary import detect_long_text_columns
+
+            heuristic_candidates, _ = detect_long_text_columns(
+                df_source,
+                min_avg_len=50,
+                min_unique_ratio=0.7,
+            )
+            subset = subset[subset["name"].isin([str(col) for col in heuristic_candidates])]
+        if subset.empty:
+            continue
+
+        columns = subset["name"].tolist()
+        formats = sorted(
+            {
+                str(v).strip()
+                for v in subset["format"].dropna().tolist()
+                if str(v).strip()
+            }
+        )
+        reason = f"{len(columns)} colonne(s) détectée(s)"
+        if formats:
+            reason += f" ({', '.join(formats[:3])})"
+
+        diagnostics.append(
+            {
+                "id": diag_id,
+                "label": label,
+                "needed": True,
+                "reason": reason,
+                "details": {
+                    "columns": columns,
+                    "formats": formats,
+                    "semantic_types": sorted(semantic_types),
+                },
+                "compute_module": "VerbatimSummary" if diag_id == "semantic_verbatim" else None,
+                "render_module": "Preparation1",
+                "available": available,
+            }
+        )
+
+    return diagnostics
+
+
+def store_preparation1_diagnostics(diagnostics: list[dict]) -> None:
+    semantic_ids = {
+        "semantic_dates",
+        "semantic_geo",
+        "semantic_identifiers",
+        "semantic_verbatim",
+    }
+    for diag_id in semantic_ids:
+        remove_preparation_diagnostic(diag_id)
+
+    for diagnostic in diagnostics:
+        set_preparation_diagnostic(diagnostic)
+
+
 # ----------- Streamlit main step ----------- #
 
-def run():
+def run_preparation_only():
     mode = "automatique" if st.session_state.get("__PIPELINE_FORCE_AUTO__", False) else st.session_state.get(MODE_KEY, "automatique")
     silent_after_upload = bool(st.session_state.get("__PIPELINE_SILENT__", False)) or (mode == "automatique")
 
-    # -------- Init session_state --------
-    st.session_state.setdefault("etape1_terminee", False)
-    st.session_state.setdefault("__UPLOAD_NONCE__", 0)
-    st.session_state.setdefault("df", None)
-    st.session_state.setdefault("variables_list_validated", False)
-    st.session_state.setdefault("df_selected", None)
-
-    # -------- 1) Upload --------
-    # param
-    
-    st.write("L'application scanClues permet de préparer et analyser vos jeux de données tabulaires. Une présentation est fournie ci-dessous.")
-       
-    with st.expander("A propos de l'application", expanded=False):
-        st.write("""
-            L'application scanClues permet de traiter les jeux de données tabulaires (fichiers CSV, excel), plus particulièrement:
-            - de préparer le jeu de données brut : nettoyage (données manquantes, anormales, doublons,...), et de l'enrichir (textes, dates, géolocalisation,...)
-            - d'analyser la distribution et la relation entre les variables
-            - d'extraire des insights et des recommandations: profiling sur tout le jeu de données et sur une cible, de mesurer pour chaque segment les actions qui ont le plus d'impact sur la cible.
-            - de fournir un rapport dans l'appli et exportable sous forme de fichiers HTML et csvs qui résument les analyses et insights extraits.
-            - de poser des questions sur l'analyse réalisée
-            
-            L'utilisateur doit intervenir à plusieurs étapes pour:\n
-            0- vérifier que le jeu de données correspond au format attendu (voir plus bas)\n
-            1- upload : télécharger le jeu de données\n
-            2- sélectionner son objectif: préparation du jeu de données, et le profilage, et l'analyse descriptive et en option (avec ou sans brief) définir ce qu'il cherche\n
-            3- lire le rapport dans l'application et/ou la télécharger (fichiers HTML et CSVs)\n
-            4- poser des questions\n
-            
-            Les traitements en cours d'exécution sont affichés sous le menu: module (parmi les 34) et la fonction (parmi une centaine).
-            L'icône en haut à droite indique si un traitement est en cours: il faut attendre 1 minute entre les étapes 1- et 2-, puis plusieurs minutes entre 2- et 3- suivant les traitements demandés et la richesse du jeu de données.
-                          
-            L'application est particulièrement adaptée aux cas d'usage suivants : enquêtes, analyses marketing (CRM, web analytics...), RH (satisfaction, attrition...), open data, etc.
-            
-            Les formats de fichiers supportés sont:\n
-            - CSV (séparateur point-virgule) .csv et Excel .xlsx \n
-            - Le nom des champs doit être sur la 1ère ligne\n
-            - pas de défaut majeur : saut de ligne, décalage de colonnes,...\n
-            
-            L'application utilise les meilleurs modèles d'IA, LLM et statistiques, pour automatiser l'analyse des données tabulaires.
-            C'est la version alpha, sur un mode "work in progress".
-            
-            Des cas d'usage sont présentés à cette adresse : https://www.scanclues.com/#cas-d-usage
-            """)
-
-    st.subheader("Upload")
-    with st.expander("Paramètres pour la préparation préliminaire", expanded=False):
-
-        st.slider(
-            "Nombre maximal d'observations à conserver après nettoyage",
-            min_value=1000,
-            max_value=50000,
-            value=10000,
-            step=500,
-            key="sample_size"
-        )
-
-        st.slider("Nombre maximal de colonnes", min_value=100, max_value=1500, value=300, key = "columns_number")
-
-        st.slider("Nombre max. de caractères pour les noms de colonnes", min_value=5, max_value=120, value=50, key = "max_chars")
-
-    st.markdown("#### Téléchargement du fichier")
-
-    # Choix de l'encodage
-    encoding_choice = st.selectbox(
-        "Choisissez l'encodage du fichier (si vous ne savez pas, laissez latin-1)",
-        options=["latin-1", "utf-8", "utf-16", "cp1252"],
-        index=0  # latin-1 par défaut
-    )
-
-    # blocage des fichiers trop gros
-    MAX_FILE_SIZE_MB = 30
-
-    uploaded_file = st.file_uploader(
-        "Téléchargez le fichier (.csv ou .xlsx)",
-        type=["csv", "xls", "xlsx"],
-        key=f"upload_file_{st.session_state.get('__UPLOAD_NONCE__', 0)}",
-    )
-
-    if uploaded_file is not None:
-        size_mb = uploaded_file.size / (1024 * 1024)
-        if size_mb > MAX_FILE_SIZE_MB:
-            st.error(f"Fichier trop volumineux ({size_mb:.1f} MB). Limite : {MAX_FILE_SIZE_MB} MB.")
-            st.stop()
-
-    if uploaded_file:
-        try:
-            if uploaded_file.name.lower().endswith((".xls", ".xlsx")):
-                df = pd.read_excel(uploaded_file)
-            else:
-                df = pd.read_csv(uploaded_file, sep=";", encoding=encoding_choice)
-
-            st.session_state.df = df
-            st.success("Fichier téléchargé.")
-            st.write("#### Aperçu du jeu de données :", df)
-        except Exception as e:
-            st.error(f"Error loading file : {e}")
-
-    # Sans fichier, on sort
+    init_preparation_state()
     if st.session_state.df is None:
         return
 
@@ -341,6 +361,21 @@ def run():
                 ignore_index=True
             )
             st.session_state.prep_step = 1
+        elif "prep_step" not in st.session_state:
+            st.session_state.prep_step = max(1, int(len(st.session_state.process)))
+
+        if st.session_state.get("download_sampled"):
+            process_df = st.session_state.get("process")
+            process_text = (
+                process_df["Traitement"].astype(str).str.lower().tolist()
+                if isinstance(process_df, pd.DataFrame) and "Traitement" in process_df.columns
+                else []
+            )
+            if not any("echantillonnage" in text or "échantillonnage" in text for text in process_text):
+                preparation_process(
+                    df0,
+                    f"Echantillonnage alÃ©atoire Ã  {st.session_state.sample_size} lignes lors du tÃ©lÃ©chargement du fichier.",
+                )
 
         if df0.shape[1] > st.session_state.columns_number:
             st.session_state["etape1_terminee"] = False
@@ -395,6 +430,7 @@ def run():
 
         st.session_state.forced_types = forced_types
         st.session_state.df_semantic_types = df_semantic
+        store_preparation1_diagnostics(diagnose_semantic_types(df_semantic, df_source=df_types))
 
         df_raw = df_types.copy()
         for col, target_type in forced_types.items():
@@ -411,6 +447,7 @@ def run():
         set_df(DFState.RAW, df_raw, step_name="Preparation1")
         st.session_state.message_type_validated = "Types de variables detectes automatiquement"
         st.session_state["etape1_terminee"] = True
+        refresh_preparation_details_payload()
         return
 
 
@@ -442,6 +479,8 @@ def run():
             ignore_index=True
         )
         st.session_state.prep_step = 1
+    elif "prep_step" not in st.session_state:
+        st.session_state.prep_step = max(1, int(len(st.session_state.process)))
 
     # test du nombre de colonnes
     if df0.shape[1] > st.session_state.columns_number:
@@ -548,6 +587,7 @@ def run():
 
     st.session_state.forced_types = forced_types
     st.session_state.df_semantic_types = df_semantic
+    store_preparation1_diagnostics(diagnose_semantic_types(df_semantic, df_source=df_types))
 
     st.markdown("##### Types de variables détectés par le modèle")
     st.dataframe(df_semantic)
@@ -571,6 +611,7 @@ def run():
     st.session_state.message_type_validated = "Types de variables détectés automatiquement"
     st.success(st.session_state.message_type_validated)
     st.write("Aperçu final :", df_raw.head())
+    refresh_preparation_details_payload()
 
     csv = df_raw.to_csv(index=False, sep=';', encoding='latin-1')
     st.download_button(
@@ -587,6 +628,10 @@ def run():
     if st.session_state["etape1_terminee"]:
         st.success("Vous pouvez lancer la prochaine etape dans le menu a gauche : Diagnostic global.")
         return
+
+
+def run():
+    run_preparation_only()
 
 
 
