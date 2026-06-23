@@ -1,10 +1,9 @@
-import json
-import os
+from __future__ import annotations
+
 from typing import Any
 
 import pandas as pd
 import streamlit as st
-from openai import OpenAI
 
 from core.analysis_capabilities import (
     DISTRIB_KEYWORDS,
@@ -32,143 +31,120 @@ def _match_columns(df: pd.DataFrame, brief: str) -> list[str]:
     return matches
 
 
-def _mark_plan(plan: list[dict[str, Any]]) -> None:
-    st.session_state["brief_analysis_plan"] = plan
-    st.session_state["brief_results_synthesis"] = "\n".join(
-        [f"- {p.get('module')} ({p.get('reason', '')})" for p in plan]
-    )
-    st.session_state["brief_relevance"] = True
-    st.session_state["brief_plan_ready"] = True
+def resolve_brief_analysis_plan(df_source: pd.DataFrame | None) -> dict[str, Any]:
+    """Résout le brief utilisateur sans appel LLM et sans modifier session_state.
 
-
-def run_brief_agent(df_source: pd.DataFrame | None) -> None:
-    """
-    Agent léger pour interpréter le brief et activer les modules pertinents.
-    - Ne s'exécute qu'en mode 'ab' et si le cadrage est prêt.
-    - Alimente st.session_state avec la cible du brief, les variables illustratives,
-      les flags de performance et le plan d'analyse.
+    Le brief n'est pas un orchestrateur concurrent : il produit uniquement un
+    contexte d'analyse déterministe que PipelineRunner applique ensuite.
     """
     mode = st.session_state.get("dataset_key_questions_mode", "sb")
     brief = str(st.session_state.get("dataset_key_questions_value", "") or "")
 
+    empty = {
+        "active": False,
+        "target": None,
+        "illustratives": [],
+        "run_sankey_crosstabs": False,
+        "generate_distribution_figures": False,
+        "plan": [],
+        "reason": "brief inactif",
+    }
     if mode != "ab" or not brief.strip():
-        return
+        return empty
     if not _has_context_ready():
-        return
+        return {**empty, "reason": "cadrage indisponible"}
     if not isinstance(df_source, pd.DataFrame) or df_source.empty:
-        return
+        return {**empty, "reason": "dataset indisponible"}
 
-    brief_low = brief.lower()
     cols = _match_columns(df_source, brief)
-
-    target = None
-    illustratives: list[str] = []
-    if cols:
-        target = cols[0]
-        illustratives = [c for c in cols[1:] if c != target]
-        st.session_state["brief_target_variable"] = target
-        st.session_state["brief_illustrative_variables"] = illustratives
-
-        tv = st.session_state.get("target_variables", [])
-        st.session_state["target_variables"] = [target] + [t for t in tv if t != target]
-
-        iv = st.session_state.get("illustrative_variables", [])
-        st.session_state["illustrative_variables"] = illustratives + [
-            i for i in iv if i not in illustratives and i != target
-        ]
-        st.session_state["brief_reason"] = "variable cible détectée dans le brief"
-    else:
-        st.session_state["brief_reason"] = "aucune variable du brief trouvée dans le dataset"
-
+    brief_low = brief.lower()
+    target = cols[0] if cols else None
+    illustratives = [c for c in cols[1:] if c != target]
     rel_flag = any(k in brief_low for k in RELATION_KEYWORDS) or len(cols) >= 2
     dist_flag = any(k in brief_low for k in DISTRIB_KEYWORDS)
 
+    plan: list[dict[str, Any]] = []
     if rel_flag:
-        st.session_state["run_sankey_crosstabs"] = True
+        plan.append({
+            "module": "CrosstabsDetail",
+            "params": {"run_sankey_crosstabs": True},
+            "reason": "relation ou comparaison identifiée dans le brief",
+        })
+        plan.append({
+            "module": "DiagramSankey",
+            "params": {"target": target, "profiles": illustratives},
+            "reason": "relations principales à visualiser",
+        })
     if dist_flag:
+        plan.append({
+            "module": "DistributionsDetail",
+            "params": {"generate_distribution_figures": True},
+            "reason": "demande de distribution ou de répartition",
+        })
+    if target:
+        plan.append({
+            "module": "Profils_y",
+            "params": {"target": target, "profiles": illustratives},
+            "reason": "cible détectée explicitement dans le brief",
+        })
+
+    return {
+        "active": bool(plan or target or rel_flag or dist_flag),
+        "target": target,
+        "illustratives": illustratives,
+        "run_sankey_crosstabs": rel_flag,
+        "generate_distribution_figures": dist_flag,
+        "plan": plan,
+        "reason": "variable cible détectée dans le brief" if target else "aucune variable explicite détectée",
+    }
+
+
+def apply_brief_analysis_plan(resolved: dict[str, Any]) -> None:
+    """Applique le contexte de brief dans un périmètre de clés documenté."""
+    if not resolved.get("active"):
+        st.session_state["brief_relevance"] = False
+        st.session_state["brief_reason"] = resolved.get("reason", "brief inactif")
+        return
+
+    target = resolved.get("target")
+    illustratives = list(resolved.get("illustratives") or [])
+
+    if target:
+        st.session_state["brief_target_variable"] = target
+        tv = list(st.session_state.get("target_variables", []) or [])
+        st.session_state["target_variables"] = [target] + [t for t in tv if t != target]
+
+    if illustratives:
+        st.session_state["brief_illustrative_variables"] = illustratives
+        iv = list(st.session_state.get("illustrative_variables", []) or [])
+        st.session_state["illustrative_variables"] = illustratives + [
+            i for i in iv if i not in illustratives and i != target
+        ]
+
+    if resolved.get("run_sankey_crosstabs"):
+        st.session_state["run_sankey_crosstabs"] = True
+    if resolved.get("generate_distribution_figures"):
         st.session_state["generate_distribution_figures"] = True
 
-    llm_plan: list[dict[str, Any]] = []
-    try:
-        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        payload = {
-            "brief": brief,
-            "columns": [str(c) for c in df_source.columns][:120],
-            "dataset_object": st.session_state.get("dataset_object"),
-            "dataset_context": st.session_state.get("dataset_context"),
-            "target_variables": st.session_state.get("target_variables", []),
-            "illustrative_variables": st.session_state.get("illustrative_variables", []),
-            "module_catalog": get_module_catalog(),
-        }
-        sys_prompt = """Tu es un planificateur d'analyses pour une app Streamlit.
-Réponds uniquement par un JSON strict: {"plan":[{"module":str,"params":dict,"reason":str},...]}.
-Règles:
-- Uniquement des modules présents dans module_catalog.
-- Si le brief cite une colonne, la mettre en cible prioritaire.
-- Relation/impact/comparaison -> CrosstabsDetail + DiagramSankey (run_sankey_crosstabs=true).
-- Distributions/répartition/histogrammes -> DistributionsDetail (generate_distribution_figures=true).
-- Profils/segments -> Profils_y (target=cible).
-- Pas de doublons, max 6 entrées, reason court en français."""
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
-            ],
-            max_tokens=400,
-        )
-        content = response.choices[0].message.content
-        parsed = json.loads(content)
-        llm_plan = parsed.get("plan", []) if isinstance(parsed, dict) else []
-        st.session_state["brief_llm_plan_raw"] = parsed
-    except Exception as exc:
-        st.session_state["brief_llm_error"] = f"brief_agent_llm: {exc}"
-        llm_plan = []
-
-    plan: list[dict[str, Any]] = []
-    plan.extend(llm_plan)
-
-    if not plan:
-        if rel_flag:
-            plan.append(
-                {
-                    "module": "CrosstabsDetail",
-                    "params": {"run_sankey_crosstabs": True},
-                    "reason": "relation variables identifiée dans le brief",
-                }
-            )
-            plan.append(
-                {
-                    "module": "DiagramSankey",
-                    "params": {"target": target, "profiles": illustratives},
-                    "reason": "vue Sankey et relations détaillées",
-                }
-            )
-        if dist_flag:
-            plan.append(
-                {
-                    "module": "DistributionsDetail",
-                    "params": {"generate_distribution_figures": True},
-                    "reason": "demande de distributions ou histogrammes",
-                }
-            )
-        if target:
-            plan.append(
-                {
-                    "module": "Profils_y",
-                    "params": {
-                        "target": target,
-                        "n_clusters_target": st.session_state.get("n_clusters_target"),
-                    },
-                    "reason": "analyse de profils pour la cible issue du brief",
-                }
-            )
-
-    if plan:
-        _mark_plan(plan)
-    else:
-        st.session_state["brief_relevance"] = False
+    plan = list(resolved.get("plan") or [])
+    st.session_state["brief_analysis_plan"] = plan
+    st.session_state["brief_results_synthesis"] = "\n".join(
+        [f"- {p.get('module')} ({p.get('reason', '')})" for p in plan]
+    )
+    st.session_state["brief_relevance"] = bool(plan)
+    st.session_state["brief_plan_ready"] = bool(plan)
+    st.session_state["brief_reason"] = resolved.get("reason", "")
 
 
-__all__ = ["get_analysis_capability_catalog", "run_brief_agent"]
+def run_brief_agent(df_source: pd.DataFrame | None) -> None:
+    """Compatibilité : résolution déterministe puis application par PipelineRunner."""
+    apply_brief_analysis_plan(resolve_brief_analysis_plan(df_source))
+
+
+__all__ = [
+    "get_analysis_capability_catalog",
+    "get_module_catalog",
+    "resolve_brief_analysis_plan",
+    "apply_brief_analysis_plan",
+    "run_brief_agent",
+]

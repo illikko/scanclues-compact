@@ -1,4 +1,4 @@
-﻿import difflib
+import difflib
 import json
 import os
 from typing import Any
@@ -31,6 +31,7 @@ from core.qa_memory import (
     update_qa_conversation_summary,
 )
 from core.reset_state import reset_app_state
+from core.qa_subset import build_subset_for_analysis, infer_subset_filters_from_question, normalize_subset_filters
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 NAV_CONTEXT_KEY = "__NAV_CONTEXT__"
@@ -68,6 +69,8 @@ def _reset_qa_history() -> None:
         "qa_segment_profils_y_text": "",
         "qa_relationship_synthesis": "",
         QA_LAST_FOLLOWUPS_KEY: [],
+        "qa_last_analysis_suggestion": {},
+        "qa_last_analysis_suggestions": [],
     }
     for key, default in state_resets.items():
         st.session_state[key] = default
@@ -193,27 +196,112 @@ def _resolve_modality_value(df: pd.DataFrame, column: str, requested: Any) -> st
     return match[0] if match else None
 
 
+def _is_explicit_reference_to_previous_segment(question: str) -> bool:
+    """Vrai uniquement quand la question renvoie explicitement au segment du tour précédent.
+
+    Une demande générique de "profil" ne doit jamais réutiliser automatiquement le
+    dernier segment mémorisé, sinon un ancien contexte comme workclass = ? peut polluer
+    une nouvelle question du type "quel est le profil des femmes ?".
+    """
+    qlow = _normalize_text(question)
+    return any(
+        token in qlow
+        for token in [
+            "ce groupe",
+            "ce segment",
+            "cette catégorie",
+            "cette categorie",
+            "cette modalité",
+            "cette modalite",
+            "ce sous-groupe",
+            "ce sous groupe",
+            "celui-ci",
+            "celle-ci",
+            "eux",
+            "elles",
+        ]
+    )
+
+
 def _resolve_subset_from_question(question: str, df: pd.DataFrame) -> dict[str, Any] | None:
     resolved = resolve_segment_from_question(question, df)
     if resolved:
         return resolved
+
+    # Fallback anaphorique strict : on ne reprend le segment précédent que si
+    # l'utilisateur y fait explicitement référence. Ne jamais le faire sur le
+    # seul mot "profil".
+    if not _is_explicit_reference_to_previous_segment(question):
+        return None
+
     last_segment = st.session_state.get("qa_segment_context") or {}
     column = str(last_segment.get("column") or "").strip()
     value = str(last_segment.get("value") or "").strip()
     if not column or not value or not isinstance(df, pd.DataFrame) or column not in df.columns:
         return None
-    qlow = _normalize_text(question)
-    if any(token in qlow for token in ["segment", "groupe", "profil", "profils", "ce groupe", "ce segment"]):
-        mask = df[column].astype("string") == value
-        subset_df = df.loc[mask].copy()
-        if not subset_df.empty:
-            return {
-                "column": column,
-                "value": value,
-                "df": subset_df,
-                "description": f"{column} = {value}",
-            }
+
+    mask = df[column].astype("string") == value
+    subset_df = df.loc[mask].copy()
+    if not subset_df.empty:
+        return {
+            "column": column,
+            "value": value,
+            "df": subset_df,
+            "description": f"{column} = {value}",
+        }
     return None
+
+
+
+def _filters_from_subset_info(subset_info: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(subset_info, dict):
+        return []
+    filters = subset_info.get("filters")
+    if isinstance(filters, list):
+        return [item for item in filters if isinstance(item, dict)]
+    column = str(subset_info.get("column") or "").strip()
+    value = str(subset_info.get("value") or "").strip()
+    if column and value:
+        return [{"column": column, "value": value}]
+    return []
+
+
+def _filters_from_action(action: dict[str, Any], df_ready: pd.DataFrame) -> list[dict[str, str]]:
+    """Récupère les filtres explicitement fournis par le routeur Q&A.
+
+    Formats acceptés :
+    - {"filters": [{"column": "sexe", "value": "female"}, ...]}
+    - {"filter": {"column": "sexe", "value": "female"}}
+    - {"source_column": "sexe", "source_value": "female"}
+
+    Cette fonction permet aussi les croisements : sexe=female ET race=Black.
+    """
+
+    raw_filters: list[dict[str, Any]] = []
+    filters = action.get("filters")
+    if isinstance(filters, list):
+        raw_filters.extend(item for item in filters if isinstance(item, dict))
+    single_filter = action.get("filter")
+    if isinstance(single_filter, dict):
+        raw_filters.append(single_filter)
+    source_column = str(action.get("source_column") or "").strip()
+    source_value = str(action.get("source_value") or "").strip()
+    if source_column and source_value:
+        raw_filters.append({"column": source_column, "value": source_value})
+    return normalize_subset_filters(df_ready, raw_filters)
+
+
+def _resolve_subset_filters_for_action(action: dict[str, Any], question: str, df_ready: pd.DataFrame) -> list[dict[str, str]]:
+    explicit_filters = _filters_from_action(action, df_ready)
+    if explicit_filters:
+        return explicit_filters
+
+    inferred_filters = infer_subset_filters_from_question(df_ready, question)
+    if inferred_filters:
+        return inferred_filters
+
+    subset_info = _resolve_subset_from_question(question, df_ready)
+    return normalize_subset_filters(df_ready, _filters_from_subset_info(subset_info))
 
 
 def _build_category_context_table(df: pd.DataFrame, column: str) -> pd.DataFrame | None:
@@ -478,7 +566,7 @@ def _build_question_payload(question: str, df_ready: pd.DataFrame) -> dict[str, 
         "data_sample_preview_as_csv": preview,
         "qa_recent_history": get_recent_qa_history(),
         "qa_conversation_summary": st.session_state.get(QA_CONVERSATION_SUMMARY_KEY, ""),
-        "qa_last_followup_question": st.session_state.get(QA_LAST_FOLLOWUP_KEY, ""),
+        "qa_last_analysis_suggestion": st.session_state.get(QA_LAST_FOLLOWUP_KEY, ""),
     }
 
 
@@ -530,10 +618,11 @@ Règles :
 - N'utilise que des noms de colonnes présents dans "columns".
 - Ne crée aucune variable ni score inexistant.
 - Compare explicitement la question utilisateur aux exemples du "capability_guide" avant de choisir une action.
-- Si la question porte sur une catégorie d'observations identifiable (ex. race=Black), utilise d'abord "contextualize_segment".
+- Si la question demande l'effectif, la part, le pourcentage ou la taille d'une catégorie identifiable, utilise "contextualize_segment".
+- Si la question demande le profil, le portrait ou les caractéristiques d'une catégorie identifiable, utilise "run_distribution_profile" sans ajouter "contextualize_segment", sauf si la question demande aussi explicitement l'effectif ou la part du groupe.
 - Si la question porte sur une nouvelle variable cible, utilise l'action "rerun_sankey".
 - Si la question porte sur une nouvelle modalité de cible, utilise l'action "rerun_profils_y".
-- Si la question demande plutôt un portrait / profil majoritaire ou la description d'une catégorie sans cible analytique explicite, utilise "run_distribution_profile" après "contextualize_segment".
+- Si la question demande plutôt un portrait / profil majoritaire ou la description d'une catégorie sans cible analytique explicite, utilise "run_distribution_profile".
 - Si la question demande comment les profils se distinguent au sein d'un groupe ou demande plus de détail sur un segment, utilise "rerun_profils_y_for_segment".
 - Si la question porte sur une relation, un lien, une comparaison ou un croisement entre variables, utilise en priorité "analyze_relationships".
 - Si des tris croisés sont nécessaires, utilise "run_crosstabs" avec des paires de variables.
@@ -584,11 +673,25 @@ def _sanitize_plan(plan: dict[str, Any], question: str, df_ready: pd.DataFrame) 
         any(keyword in qlow for keyword in ["profil", "portrait", "décrit", "decrit", "catégorie", "categorie", "segment", "qui sont", "ressembl"])
         and not any(keyword in qlow for keyword in ["cible", "modalité cible", "modalite cible", "top 20", "bottom 20"])
     )
+    # Le contexte de segment sert uniquement à situer une catégorie en effectif / part.
+    # Il ne doit pas être déclenché par une demande de profil, sinon d'anciens segments
+    # mémorisés peuvent ressortir hors contexte (ex. workclass = ?).
     wants_segment_context = bool(
         segment_info
         and any(
             keyword in qlow
-            for keyword in ["profil", "portrait", "catégorie", "categorie", "segment", "combien", "part", "proportion", "représent", "represent"]
+            for keyword in [
+                "combien",
+                "effectif",
+                "effectifs",
+                "part",
+                "proportion",
+                "pourcentage",
+                "poids",
+                "taille",
+                "représent",
+                "represent",
+            ]
         )
     )
 
@@ -716,6 +819,18 @@ def _sanitize_plan(plan: dict[str, Any], question: str, df_ready: pd.DataFrame) 
                 sanitized["actions"].append(action)
 
         elif action_name in PROFILE_ACTIONS or action_name in SEGMENT_ACTIONS:
+            filters = normalize_subset_filters(
+                df_ready,
+                (raw_action.get("filters") if isinstance(raw_action.get("filters"), list) else [])
+                + ([raw_action.get("filter")] if isinstance(raw_action.get("filter"), dict) else [])
+                + ([{"column": raw_action.get("source_column"), "value": raw_action.get("source_value")}]
+                   if raw_action.get("source_column") and raw_action.get("source_value") else []),
+            )
+            if filters:
+                action["filters"] = filters
+                if len(filters) == 1:
+                    action["source_column"] = filters[0]["column"]
+                    action["source_value"] = filters[0]["value"]
             sanitized["actions"].append(action)
 
         elif action_name in PREPARATION_ACTIONS:
@@ -745,6 +860,13 @@ def _sanitize_plan(plan: dict[str, Any], question: str, df_ready: pd.DataFrame) 
                     "reason": "fallback heuristique sur les variables citées dans la question",
                 }
             )
+
+    if not wants_segment_context:
+        sanitized["actions"] = [
+            action
+            for action in sanitized["actions"]
+            if action.get("action") != "contextualize_segment"
+        ]
 
     if wants_segment_context and not any(action.get("action") == "contextualize_segment" for action in sanitized["actions"]):
         sanitized["actions"].insert(
@@ -863,11 +985,33 @@ def _rewrite_segment_profils_text(text: str, column: str, value: str) -> str:
     return f"{objective}\n\n{raw}"
 
 
+def _suggestion_label(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("label") or item.get("instruction") or "").strip()
+    return str(item or "").strip()
+
+
+def _suggestion_instruction(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("instruction") or item.get("label") or "").strip()
+    return str(item or "").strip()
+
+
+def _make_analysis_suggestion(label: str, instruction: str | None = None, action_hint: str | None = None) -> dict[str, str]:
+    suggestion = {
+        "label": str(label or "").strip(),
+        "instruction": str(instruction or label or "").strip(),
+    }
+    if action_hint:
+        suggestion["action_hint"] = str(action_hint).strip()
+    return suggestion
+
+
 def _get_recent_suggested_questions(max_items: int = 10) -> list[str]:
     suggestions: list[str] = []
     for item in get_recent_qa_history(max_items=max_items):
-        for followup in item.get("followup_questions") or []:
-            text = str(followup or "").strip()
+        for suggestion in (item.get("analysis_suggestions") or item.get("followup_questions") or []):
+            text = _suggestion_instruction(suggestion)
             if text and text not in suggestions:
                 suggestions.append(text)
     return suggestions
@@ -881,8 +1025,8 @@ def _canonical_question(text: str) -> str:
 def _build_adaptive_followups(
     question: str,
     execution_log: list[dict[str, Any]],
-    llm_followups: list[str],
-) -> list[str]:
+    llm_followups: list[Any],
+) -> list[dict[str, str]]:
     previous = {_canonical_question(item): item for item in _get_recent_suggested_questions()}
     normalized_question = _canonical_question(question)
     recent_history = get_recent_qa_history(max_items=6)
@@ -892,17 +1036,18 @@ def _build_adaptive_followups(
         for action in (turn.get("execution_log") or [])
         if isinstance(action, dict)
     }
-    followups: list[str] = []
+    followups: list[dict[str, str]] = []
 
     for item in llm_followups:
-        text = str(item or "").strip()
-        if not text:
+        label = _suggestion_label(item)
+        instruction = _suggestion_instruction(item)
+        if not label or not instruction:
             continue
-        lowered = _canonical_question(text)
+        lowered = _canonical_question(instruction)
         if lowered == normalized_question or lowered in previous:
             continue
-        if text not in followups:
-            followups.append(text)
+        if instruction not in [_suggestion_instruction(x) for x in followups]:
+            followups.append(_make_analysis_suggestion(label, instruction))
 
     for item in execution_log:
         action_name = str(item.get("action") or "").strip()
@@ -910,39 +1055,55 @@ def _build_adaptive_followups(
             subset_value = str(item.get("subset_value") or "").strip()
             subset_column = str(item.get("subset_column") or "").strip()
             if subset_value and subset_column:
-                suggestion = f"Comment se distinguent les profils au sein du groupe '{subset_value}' pour la variable '{subset_column}' ?"
+                suggestion = _make_analysis_suggestion(
+                    f"Identifier les sous-profils de '{subset_value}'",
+                    f"Identifie les profils distincts au sein du groupe '{subset_value}' pour la variable '{subset_column}'.",
+                    "rerun_profils_y_for_segment",
+                )
                 if (
                     "rerun_profils_y_for_segment" not in recent_actions
-                    and _canonical_question(suggestion) not in previous
-                    and suggestion not in followups
+                    and _canonical_question(suggestion["instruction"]) not in previous
+                    and suggestion["instruction"] not in [_suggestion_instruction(x) for x in followups]
                 ):
                     followups.append(suggestion)
         elif action_name == "rerun_profils_y_for_segment":
             subset_value = str(item.get("subset_value") or "").strip()
             subset_column = str(item.get("subset_column") or "").strip()
             if subset_value and subset_column:
-                suggestion = f"Souhaitez-vous comparer le groupe '{subset_value}' ({subset_column}) à une autre variable de l'étude ?"
-                if _canonical_question(suggestion) not in previous and suggestion not in followups:
+                suggestion = _make_analysis_suggestion(
+                    f"Comparer '{subset_value}' à une autre variable",
+                    f"Compare le groupe '{subset_value}' ({subset_column}) à une autre variable de l'étude.",
+                    "analyze_relationships",
+                )
+                if _canonical_question(suggestion["instruction"]) not in previous and suggestion["instruction"] not in [_suggestion_instruction(x) for x in followups]:
                     followups.append(suggestion)
-                suggestion = f"Voulez-vous explorer les relations entre '{subset_column}' et une autre variable pour ce groupe ?"
-                if _canonical_question(suggestion) not in previous and suggestion not in followups:
+                suggestion = _make_analysis_suggestion(
+                    f"Explorer les relations autour de '{subset_column}'",
+                    f"Explore les relations entre '{subset_column}' et une autre variable pour ce groupe.",
+                    "analyze_relationships",
+                )
+                if _canonical_question(suggestion["instruction"]) not in previous and suggestion["instruction"] not in [_suggestion_instruction(x) for x in followups]:
                     followups.append(suggestion)
         elif action_name == "analyze_relationships":
             variables = item.get("available_variables") or item.get("variables") or []
             if isinstance(variables, list) and len(variables) >= 2:
-                suggestion = f"Souhaitez-vous approfondir la relation entre {variables[0]} et {variables[1]} sur un segment précis ?"
-                if _canonical_question(suggestion) not in previous and suggestion not in followups:
+                suggestion = _make_analysis_suggestion(
+                    f"Approfondir la relation {variables[0]} × {variables[1]}",
+                    f"Approfondis la relation entre {variables[0]} et {variables[1]} sur un segment précis.",
+                    "analyze_relationships",
+                )
+                if _canonical_question(suggestion["instruction"]) not in previous and suggestion["instruction"] not in [_suggestion_instruction(x) for x in followups]:
                     followups.append(suggestion)
 
     generic_fallbacks = [
-        "Souhaitez-vous approfondir un autre segment précis de la population ?",
-        "Voulez-vous croiser cette analyse avec une autre variable encore non explorée ?",
-        "Souhaitez-vous une lecture plus détaillée d'un autre profil identifié ?",
+        _make_analysis_suggestion("Approfondir un segment précis", "Approfondis un autre segment précis de la population."),
+        _make_analysis_suggestion("Croiser avec une autre variable", "Croise cette analyse avec une autre variable encore non explorée."),
+        _make_analysis_suggestion("Détailler un profil identifié", "Produis une lecture plus détaillée d'un autre profil identifié."),
     ]
     for suggestion in generic_fallbacks:
-        if _canonical_question(suggestion) in previous or _canonical_question(suggestion) == normalized_question:
+        if _canonical_question(suggestion["instruction"]) in previous or _canonical_question(suggestion["instruction"]) == normalized_question:
             continue
-        if suggestion not in followups:
+        if suggestion["instruction"] not in [_suggestion_instruction(x) for x in followups]:
             followups.append(suggestion)
 
     return followups[:3]
@@ -1063,6 +1224,7 @@ def _execute_action_plan(plan: dict[str, Any], df_ready: pd.DataFrame, question:
                     source_column = str(subset_info.get("column") or "")
                     source_value = str(subset_info.get("value") or "")
                     temp_df, derived_target, derived_modality = _build_segment_binary_target(df_ready, source_column, source_value)
+                    temp_df = temp_df.drop(columns=[source_column], errors="ignore")
                     original_df_ready = st.session_state.get("df_ready")
                     original_target_variables = list(st.session_state.get("target_variables", []) or [])
                     original_brief_target = st.session_state.get("brief_target_variable")
@@ -1106,6 +1268,7 @@ def _execute_action_plan(plan: dict[str, Any], df_ready: pd.DataFrame, question:
                     result["subset_column"] = source_column
                     result["subset_value"] = source_value
                     result["derived_target"] = derived_target
+                    result["excluded_columns"] = [source_column]
                     result["produced"] = {
                         "qa_segment_profils_y_text": bool(str(st.session_state.get("qa_segment_profils_y_text") or "").strip()),
                     }
@@ -1177,20 +1340,44 @@ def _execute_action_plan(plan: dict[str, Any], df_ready: pd.DataFrame, question:
                 st.session_state["__QA_SELECTED_DISTRIBUTION_VARS__"] = []
 
             elif action_name in PROFILE_ACTIONS:
-                subset_info = _resolve_subset_from_question(question, df_ready)
+                filters = _resolve_subset_filters_for_action(action, question, df_ready)
                 original_df_ready = st.session_state.get("df_ready")
                 original_profile_text = st.session_state.get("profil_dominant_analysis")
                 original_segment_profile_text = st.session_state.get("qa_segment_profile_text")
                 original_dominant_continues = st.session_state.get("dominant_continues")
                 original_dominant_discretes = st.session_state.get("dominant_discretes")
+
                 st.session_state["__QA_SILENT__"] = True
                 st.session_state["__QA_PROFILE_OUTPUT_KEY__"] = "profil_dominant_analysis"
-                if subset_info and isinstance(subset_info.get("df"), pd.DataFrame):
+
+                if filters:
+                    segment_df, subset_spec = build_subset_for_analysis(
+                        df_ready,
+                        filters,
+                        exclude_filter_columns=True,
+                    )
+                    if segment_df.empty:
+                        result["status"] = "skipped"
+                        result["error"] = f"aucune observation pour le sous-groupe : {subset_spec.description}"
+                        st.session_state["__QA_SILENT__"] = False
+                        st.session_state.pop("__QA_SEGMENT_DF__", None)
+                        st.session_state.pop("__QA_PROFILE_OUTPUT_KEY__", None)
+                        execution_log.append(result)
+                        continue
+
                     st.session_state["qa_segment_profile_text"] = ""
-                    st.session_state["__QA_SEGMENT_DF__"] = subset_info["df"]
+                    st.session_state["__QA_SEGMENT_DF__"] = segment_df
                     st.session_state["__QA_PROFILE_OUTPUT_KEY__"] = "qa_segment_profile_text"
-                    st.session_state["qa_last_subset_description"] = subset_info.get("description")
-                    st.session_state["qa_segment_subdataset"] = subset_info.get("df")
+                    st.session_state["qa_last_subset_description"] = subset_spec.description
+                    st.session_state["qa_segment_subdataset"] = segment_df
+                    result["subset"] = subset_spec.description
+                    result["filters"] = list(subset_spec.filters)
+                    result["excluded_columns"] = list(subset_spec.excluded_columns)
+                    result["subset_row_count"] = subset_spec.row_count
+                    result["total_row_count"] = subset_spec.total_count
+                else:
+                    subset_spec = None
+
                 PROFILE_ACTIONS[action_name]()
                 st.session_state["__QA_SILENT__"] = False
                 st.session_state.pop("__QA_SEGMENT_DF__", None)
@@ -1204,13 +1391,14 @@ def _execute_action_plan(plan: dict[str, Any], df_ready: pd.DataFrame, question:
                     "profil_dominant_analysis": bool(str(st.session_state.get("profil_dominant_analysis") or "").strip()),
                     "qa_segment_profile_text": bool(str(st.session_state.get("qa_segment_profile_text") or "").strip()),
                 }
-                if subset_info:
-                    result["subset"] = subset_info.get("description")
-                    result["subset_column"] = subset_info.get("column")
-                    result["subset_value"] = subset_info.get("value")
+                if filters:
                     result["profile_output_key"] = "qa_segment_profile_text"
+                    if len(filters) == 1:
+                        result["subset_column"] = filters[0]["column"]
+                        result["subset_value"] = filters[0]["value"]
                     if not str(st.session_state.get("qa_segment_profile_text") or "").strip():
-                        st.session_state["qa_segment_profile_text"] = str(original_segment_profile_text or "")
+                        result["status"] = "error"
+                        result["error"] = "le profil du sous-groupe n'a pas été produit"
                 elif original_profile_text != st.session_state.get("profil_dominant_analysis"):
                     result["subset"] = "population complète"
 
@@ -1278,18 +1466,21 @@ def _build_existing_analysis_digest(exclude_sources: set[str] | None = None) -> 
     return digest
 
 
-def _normalize_followup_questions(parsed: dict[str, Any]) -> list[str]:
-    questions: list[str] = []
-    raw_list = parsed.get("followup_questions")
+def _normalize_followup_questions(parsed: dict[str, Any]) -> list[dict[str, str]]:
+    suggestions: list[dict[str, str]] = []
+    raw_list = parsed.get("analysis_suggestions") or parsed.get("followup_questions")
     if isinstance(raw_list, list):
         for item in raw_list:
-            text = str(item or "").strip()
-            if text and text not in questions:
-                questions.append(text)
-    single = str(parsed.get("followup_question") or "").strip()
-    if single and single not in questions:
-        questions.insert(0, single)
-    return questions[:3]
+            label = _suggestion_label(item)
+            instruction = _suggestion_instruction(item)
+            if label and instruction and instruction not in [_suggestion_instruction(x) for x in suggestions]:
+                suggestions.append(_make_analysis_suggestion(label, instruction, item.get("action_hint") if isinstance(item, dict) else None))
+    single = parsed.get("analysis_suggestion") or parsed.get("followup_question")
+    label = _suggestion_label(single)
+    instruction = _suggestion_instruction(single)
+    if label and instruction and instruction not in [_suggestion_instruction(x) for x in suggestions]:
+        suggestions.insert(0, _make_analysis_suggestion(label, instruction))
+    return suggestions[:3]
 
 
 def _generate_final_answer(question: str, execution_log: list[dict[str, Any]], df_ready: pd.DataFrame) -> dict[str, str]:
@@ -1309,9 +1500,13 @@ def _generate_final_answer(question: str, execution_log: list[dict[str, Any]], d
                     "role": "system",
                     "content": (
                         "Tu rédiges une réponse Q&A à partir d'analyses déjà produites. "
-                        'Réponds uniquement par un JSON strict {"intro":"...","answer":"...","followup_questions":["..."]} '
+                        'Réponds uniquement par un JSON strict {"intro":"...","answer":"...","analysis_suggestions":[{"label":"...","instruction":"...","action_hint":"..."}]} '
                         "en t'appuyant d'abord sur existing_analysis_digest. "
-                        "N'invente rien au-delà des synthèses fournies."
+                        "N'invente rien au-delà des synthèses fournies. "
+                        "Les analysis_suggestions ne doivent pas être formulées comme des questions, "
+                        "mais comme des propositions d'analyses cliquables. "
+                        "Le champ label est le texte court affiché dans l'interface. "
+                        "Le champ instruction est la demande complète envoyée au routeur Q&A."
                     ),
                 },
                 {
@@ -1338,18 +1533,22 @@ def _generate_final_answer(question: str, execution_log: list[dict[str, Any]], d
         return {
             "intro": str(parsed.get("intro") or "").strip(),
             "answer": str(parsed.get("answer") or "").strip(),
-            "followup_question": followup_questions[0] if followup_questions else "",
-            "followup_questions": followup_questions,
+            "analysis_suggestion": followup_questions[0] if followup_questions else {},
+            "analysis_suggestions": followup_questions,
+            "followup_question": _suggestion_instruction(followup_questions[0]) if followup_questions else "",
+            "followup_questions": [_suggestion_instruction(x) for x in followup_questions],
             "raw_answer": raw_answer,
         }
 
     sys_prompt = """Tu rédiges la réponse finale visible par l'utilisateur.
-Réponds uniquement par un JSON strict {"intro":"...","answer":"...","followup_questions":["..."]}.
+Réponds uniquement par un JSON strict {"intro":"...","answer":"...","analysis_suggestions":[{"label":"...","instruction":"...","action_hint":"..."}]}.
 
 Règles :
 - "intro" doit contenir 1 à 3 phrases maximum pour contextualiser la réponse.
 - "answer" doit répondre clairement à la question en t'appuyant sur les analyses disponibles.
-- "followup_questions" doit proposer 2 ou 3 questions de relance utiles, concrètes et cohérentes avec l'historique Q&A.
+- "analysis_suggestions" doit proposer 2 ou 3 analyses utiles, concrètes, cliquables et cohérentes avec l'historique Q&A.
+- Chaque suggestion contient un "label" court orienté action, et une "instruction" complète envoyable au routeur Q&A.
+- Ne formule pas les suggestions comme des questions ; utilise des verbes d'analyse : comparer, explorer, identifier, détailler, recalculer.
 - N'écris jamais "les artefacts sont suffisants", "notes LLM", "plan JSON", "outil", "capability" ou tout jargon interne.
 - Si une analyse complémentaire a été exécutée, tu peux le mentionner simplement en langage métier.
 - Si l'information manque encore, dis-le franchement et précise la limite sans inventer.
@@ -1374,8 +1573,10 @@ Règles :
     return {
         "intro": str(parsed.get("intro") or "").strip(),
         "answer": str(parsed.get("answer") or "").strip(),
-        "followup_question": followup_questions[0] if followup_questions else "",
-        "followup_questions": followup_questions,
+        "analysis_suggestion": followup_questions[0] if followup_questions else {},
+        "analysis_suggestions": followup_questions,
+        "followup_question": _suggestion_instruction(followup_questions[0]) if followup_questions else "",
+        "followup_questions": [_suggestion_instruction(x) for x in followup_questions],
         "raw_answer": raw_answer,
     }
 
@@ -1667,13 +1868,19 @@ def _process_qa_question(question: str, df_ready: pd.DataFrame) -> bool:
 
         intro = final_answer.get("intro") or "Voici la lecture la plus utile à partir des analyses disponibles."
         answer = final_answer.get("answer") or "Je n'ai pas pu produire de réponse exploitable à partir des éléments disponibles."
-        followup_questions = final_answer.get("followup_questions") or []
-        if not isinstance(followup_questions, list):
-            followup_questions = []
-        followup_questions = [str(x).strip() for x in followup_questions if str(x).strip()][:3]
-        followup_question = followup_questions[0] if followup_questions else ""
+        analysis_suggestions = final_answer.get("analysis_suggestions") or final_answer.get("followup_questions") or []
+        if not isinstance(analysis_suggestions, list):
+            analysis_suggestions = []
+        analysis_suggestions = [
+            _make_analysis_suggestion(_suggestion_label(x), _suggestion_instruction(x))
+            for x in analysis_suggestions
+            if _suggestion_label(x) and _suggestion_instruction(x)
+        ][:3]
+        analysis_suggestion = analysis_suggestions[0] if analysis_suggestions else {}
+        followup_question = _suggestion_instruction(analysis_suggestion) if analysis_suggestion else ""
+        st.session_state["qa_last_analysis_suggestion"] = analysis_suggestion
         st.session_state["qa_last_followup_question"] = followup_question
-        st.session_state[QA_LAST_FOLLOWUPS_KEY] = followup_questions
+        st.session_state[QA_LAST_FOLLOWUPS_KEY] = analysis_suggestions
 
         append_qa_history(
             {
@@ -1681,8 +1888,10 @@ def _process_qa_question(question: str, df_ready: pd.DataFrame) -> bool:
                 "effective_question": effective_question,
                 "intro": intro,
                 "answer": answer,
+                "analysis_suggestion": analysis_suggestion,
+                "analysis_suggestions": analysis_suggestions,
                 "followup_question": followup_question,
-                "followup_questions": followup_questions,
+                "followup_questions": [_suggestion_instruction(x) for x in analysis_suggestions],
                 "execution_log": execution_log,
                 "actions": plan.get("actions", []),
                 "used_artifacts": _extract_used_artifacts(execution_log),
@@ -1713,15 +1922,21 @@ def run() -> None:
 
     if isinstance(history, list) and history:
         _render_chat_sequence(history[-6:], latest_execution_log=last_execution_log)
-        suggested_followups = last_followups if isinstance(last_followups, list) else []
-        suggested_followups = [str(x).strip() for x in suggested_followups if str(x).strip()][:3]
-        if suggested_followups:
-            st.markdown("**Questions suggérées**")
-            suggestion_cols = st.columns(len(suggested_followups))
-            for idx, suggestion in enumerate(suggested_followups):
+        suggested_analyses = last_followups if isinstance(last_followups, list) else []
+        suggested_analyses = [
+            _make_analysis_suggestion(_suggestion_label(x), _suggestion_instruction(x))
+            for x in suggested_analyses
+            if _suggestion_label(x) and _suggestion_instruction(x)
+        ][:3]
+        if suggested_analyses:
+            st.markdown("**Analyses proposées**")
+            suggestion_cols = st.columns(len(suggested_analyses))
+            for idx, suggestion in enumerate(suggested_analyses):
+                label = suggestion.get("label", "")
+                instruction = suggestion.get("instruction", label)
                 with suggestion_cols[idx]:
-                    if st.button(suggestion, key=f"qa_followup_suggestion_{idx}", use_container_width=True):
-                        if _process_qa_question(suggestion, df_ready):
+                    if st.button(label, key=f"qa_analysis_suggestion_{idx}", use_container_width=True):
+                        if _process_qa_question(instruction, df_ready):
                             st.rerun()
 
     input_col, send_col = st.columns([12, 1])

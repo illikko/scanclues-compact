@@ -1,5 +1,11 @@
-﻿import copy
+import copy
 from typing import Any
+
+
+from core.qa_capabilities import (
+    get_qa_capabilities as get_qa_functional_capability_catalog,
+    get_report_artifacts as get_report_artifact_catalog,
+)
 
 
 RELATION_KEYWORDS = [
@@ -41,14 +47,14 @@ ANALYSIS_CAPABILITY_CATALOG = [
         "defaults": {"run_sankey_crosstabs": True, "generate_distribution_figures": True},
         "when_to_use": "Utiliser quand la question porte sur un lien, une comparaison ou un croisement entre deux variables ou plus.",
         "example_questions": [
-            "Quel lien entre race et income ?",
-            "Croise sexe et revenu",
-            "Y a-t-il une relation entre Ã¢ge et revenu ?",
-            "Quel lien entre race, sexe et income ?",
+            "Quel lien entre <variable_a> et <variable_b> ?",
+            "Croise <variable_a> et <variable_b>.",
+            "Y a-t-il une relation entre <variable_a> et <variable_b> ?",
+            "Compare <variable_cible> avec plusieurs variables explicatives.",
         ],
         "example_parameters": [
-            {"pairs": [["race", "income"]], "variables": ["race", "income"], "focus_question": "Quel lien entre race et income ?"},
-            {"pairs": [["race", "income"], ["sex", "income"]], "variables": ["race", "sex", "income"], "focus_question": "Quel lien entre race, sexe et income ?"},
+            {"pairs": [["<variable_a>", "<variable_b>"]], "variables": ["<variable_a>", "<variable_b>"], "focus_question": "question utilisateur reformulée"},
+            {"pairs": [["<variable_a>", "<variable_cible>"], ["<variable_b>", "<variable_cible>"]], "variables": ["<variable_a>", "<variable_b>", "<variable_cible>"], "focus_question": "question utilisateur reformulée"},
         ],
     },
     {
@@ -64,14 +70,12 @@ ANALYSIS_CAPABILITY_CATALOG = [
         "defaults": {},
         "when_to_use": "Utiliser quand la question porte sur une catÃ©gorie prÃ©cise d'observations et qu'il faut d'abord la situer dans l'Ã©chantillon global.",
         "example_questions": [
-            "Que reprÃ©sentent les personnes noires dans l'Ã©chantillon ?",
-            "Combien y a-t-il de personnes mariÃ©es ?",
-            "Quelle part des rÃ©pondants travaille dans le privÃ© ?",
+            "Que représente la modalité <modalité> de <variable> dans l'échantillon ?",
+            "Combien y a-t-il d'observations dans le groupe <variable> = <modalité> ?",
+            "Quelle part de l'échantillon correspond à <variable> = <modalité> ?",
         ],
         "example_parameters": [
-            {"column": "race", "value": "Black"},
-            {"column": "marital-status", "value": "Married-civ-spouse"},
-            {"column": "workclass", "value": "Private"},
+            {"column": "<variable>", "value": "<modalité>"},
         ],
     },
     {
@@ -183,13 +187,12 @@ ANALYSIS_CAPABILITY_CATALOG = [
         "defaults": {},
         "when_to_use": "Utiliser pour dÃ©crire le profil majoritaire d'une population ou d'une sous-population quand aucune cible analytique explicite n'est demandÃ©e.",
         "example_questions": [
-            "DÃ©cris le profil des personnes noires",
-            "Quel est le portrait des personnes mariÃ©es ?",
-            "Ã€ quoi ressemble le profil des salariÃ©s du privÃ© ?",
+            "Décris le profil du groupe <variable> = <modalité>.",
+            "Quel est le portrait majoritaire de la sous-population <modalité> ?",
+            "À quoi ressemble le profil dominant des observations du groupe <variable> = <modalité> ?",
         ],
         "example_parameters": [
-            {"column": "race", "value": "Black", "use_subdataset": True},
-            {"column": "marital-status", "value": "Married-civ-spouse", "use_subdataset": True},
+            {"column": "<variable>", "value": "<modalité>", "use_subdataset": True},
         ],
     },
     {
@@ -217,13 +220,12 @@ ANALYSIS_CAPABILITY_CATALOG = [
         "defaults": {},
         "when_to_use": "Utiliser quand la question demande ce qui distingue une sous-population du reste de l'Ã©chantillon, ou demande un niveau de dÃ©tail supÃ©rieur sur un segment.",
         "example_questions": [
-            "Comment se distinguent les profils au sein du groupe des noirs ?",
-            "Peux-tu dÃ©tailler davantage ce segment ?",
-            "Quels sont les attributs les plus caractÃ©ristiques des personnes mariÃ©es ?",
+            "Quels sont les différents profils au sein du groupe <variable> = <modalité> ?",
+            "Détaille les sous-profils de cette sous-population.",
+            "Identifie plusieurs profils distincts dans le groupe <variable> = <modalité>.",
         ],
         "example_parameters": [
-            {"source_column": "race", "source_value": "Black", "derived_target": "__qa_target__race_black"},
-            {"source_column": "marital-status", "source_value": "Married-civ-spouse", "derived_target": "__qa_target__marital_status_married"},
+            {"source_column": "<variable>", "source_value": "<modalité>", "derived_target": "__qa_target__<variable>_<modalité>"},
         ],
     },
 ]

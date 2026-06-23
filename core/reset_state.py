@@ -27,7 +27,6 @@ def reset_app_state(*, trigger_rerun: bool = True, show_success: bool = True) ->
     st.session_state["etape1_terminee"] = False
     st.session_state["etape2_terminee"] = False
     st.session_state["etape40_terminee"] = False
-    st.session_state["etape41_terminee"] = False
     st.session_state["pipeline_ready_to_run"] = False
     st.session_state["pipeline_executed"] = False
     st.session_state["pipeline_status"] = None

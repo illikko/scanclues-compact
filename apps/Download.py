@@ -38,29 +38,29 @@ def _render_intro() -> None:
     with st.expander("A propos de l'application", expanded=False):
         st.write(
             """
-            L'application scanClues permet de traiter les jeux de données tabulaires (fichiers CSV, excel), plus particulièrement:
-            - de préparer le jeu de données brut : nettoyage (données manquantes, anormales, doublons,...), et de l'enrichir (textes, dates, géolocalisation,...)
-            - d'analyser la distribution et la relation entre les variables
-            - d'extraire des insights et des recommandations: profiling sur tout le jeu de données et sur une cible, de mesurer pour chaque segment les actions qui ont le plus d'impact sur la cible.
-            - de fournir un rapport dans l'appli et exportable sous forme de fichiers HTML et csvs qui résument les analyses et insights extraits.
-            - de poser des questions sur l'analyse réalisée
+            L'application scanClues permet de traiter les jeux de données tabulaires (fichiers CSV, excel), plus particulièrement:  
+            - de préparer le jeu de données brut : nettoyage (données manquantes, anormales, doublons,...), et de l'enrichir (textes, dates, géolocalisation,...)  
+            - d'analyser la distribution et la relation entre les variables  
+            - d'extraire des insights et des recommandations: profiling sur tout le jeu de données et sur une cible, de mesurer pour chaque segment les actions qui ont le plus d'impact sur la cible.  
+            - de fournir un rapport dans l'appli et exportable sous forme de fichiers HTML et csvs qui résument les analyses et insights extraits.  
+            - de poser des questions sur l'analyse réalisée  
 
-            L'utilisateur doit intervenir à plusieurs étapes pour:
-            0- vérifier que le jeu de données correspond au format attendu (voir plus bas)
-            1- upload : télécharger le jeu de données
-            2- sélectionner son objectif: préparation du jeu de données, et le profilage, et l'analyse descriptive et en option (avec ou sans brief) définir ce qu'il cherche
-            3- lire le rapport dans l'application et/ou la télécharger (fichiers HTML et CSVs)
-            4- poser des questions
+            L'utilisateur doit intervenir à plusieurs étapes pour:  
+            0- vérifier que le jeu de données correspond au format attendu (voir plus bas)  
+            1- upload : télécharger le jeu de données  
+            2- sélectionner son objectif: préparation du jeu de données, et le profilage, et l'analyse descriptive et en option (avec ou sans brief) définir ce qu'il cherche  
+            3- lire le rapport dans l'application et/ou la télécharger (fichiers HTML et CSVs)  
+            4- poser des questions  
 
             Les traitements en cours d'exécution sont affichés sous le menu: module (parmi les 34) et la fonction (parmi une centaine).
             L'icône en haut à droite indique si un traitement est en cours: il faut attendre 1 minute entre les étapes 1- et 2-, puis plusieurs minutes entre 2- et 3- suivant les traitements demandés et la richesse du jeu de données.
 
-            L'application est particulièrement adaptée aux cas d'usage suivants : enquÃªtes, analyses marketing (CRM, web analytics...), RH (satisfaction, attrition...), open data, etc.
+            L'application est particulièrement adaptée aux cas d'usage suivants : enquêtes, analyses marketing (CRM, web analytics...), RH (satisfaction, attrition...), open data, etc.
 
             Les formats de fichiers supportés sont:
-            - CSV (séparateur point-virgule) .csv et Excel .xlsx
-            - Le nom des champs doit Ãªtre sur la 1ère ligne
-            - pas de défaut majeur : saut de ligne, décalage de colonnes,...
+            - CSV (séparateur point-virgule) .csv et Excel .xlsx  
+            - Le nom des champs doit être sur la 1ère ligne  
+            - pas de défaut majeur : saut de ligne, décalage de colonnes...  
 
             L'application utilise les meilleurs modèles d'IA, LLM et statistiques, pour automatiser l'analyse des données tabulaires.
             C'est la version alpha, sur un mode "work in progress".

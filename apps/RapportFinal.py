@@ -310,7 +310,6 @@ def _change_objectives() -> None:
     st.session_state[NAV_CONTEXT_KEY] = "view"
     st.session_state["etape2_terminee"] = False
     st.session_state["etape40_terminee"] = False
-    st.session_state["etape41_terminee"] = False
     st.session_state["__NAV_SELECTED__"] = "2"
     try:
         st.query_params["step"] = "2"
@@ -1013,7 +1012,6 @@ Le rapport d'analyse du jeu de donnees se compose des sections principales:
         html = build_final_report_html(st.session_state, locals())
         st.session_state["final_report_html"] = html
         st.session_state["final_report_ready"] = True
-        _set_rf_progress(100, "Rapport final prêt")
 
     # =============================================================
     # TELECHARGEMENT DU PACKAGE

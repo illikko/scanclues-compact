@@ -51,7 +51,7 @@ ETAPES = [
     {"numero": "1", "cle_session": "etape1_terminee", "module": Download, "label": "Upload"},
     {"numero": "2", "cle_session": "etape2_terminee", "module": DiagnosticGlobal, "label": "Définition des objectifs"},
     {"numero": "3", "cle_session": "etape40_terminee", "module": RapportFinal, "label": "Rapport Final"},
-    {"numero": "4", "cle_session": "etape41_terminee", "module": QA, "label": "Q&A"},
+    {"numero": "4", "cle_session": None, "module": QA, "label": "Q&A"},
 ]
 META = {e["numero"]: e for e in ETAPES}
 OPTIONS = tuple(e["numero"] for e in ETAPES)
@@ -79,8 +79,8 @@ def _auto_next_if_completed(active_num: str, was_done_before_run: bool):
         return
     if st.session_state.get(AUTO_JUMP_GUARD):
         return
-    key_done = META[active_num]["cle_session"]
-    is_done_now = st.session_state.get(key_done, False)
+    key_done = META[active_num].get("cle_session")
+    is_done_now = bool(key_done and st.session_state.get(key_done, False))
     if (not was_done_before_run) and is_done_now:
         nxt = _next_step_seq(active_num)
         if nxt is not None:
@@ -92,7 +92,8 @@ def _auto_next_if_completed(active_num: str, was_done_before_run: bool):
 
 
 for e in ETAPES:
-    st.session_state.setdefault(e["cle_session"], False)
+    if e.get("cle_session"):
+        st.session_state.setdefault(e["cle_session"], False)
 
 
 def _get_url_step():
@@ -134,6 +135,7 @@ st.session_state.pop(URL_GUARD_KEY, None)
 
 def _fmt(num: str) -> str:
     e = META[num]
+    cle_session = e.get("cle_session")
     short = {
         "1": "Upload",
         "2": "Objectifs",
